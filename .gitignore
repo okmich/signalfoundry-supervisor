@@ -1,0 +1,15 @@
+# build artifacts
+/supervisor
+/supervisor.exe
+*.exe
+/dist/
+
+# go
+/vendor/
+*.test
+*.out
+
+# local dev scratch (created by dev-env.ps1)
+/dev-env.ps1
+/_dev/
+/_temp_*/

@@ -35,11 +35,12 @@ type EngineInfo struct {
 	Alerts    bool      `json:"alerts"` // Telegram alerting enabled (creds present)
 }
 
-// Terminal groups the logical systems that share one broker session/account (die together).
+// Terminal groups the logical systems that share one broker session/account (die together, §7).
 type Terminal struct {
 	BrokerSessionID string   `json:"broker_session_id"`
 	Account         string   `json:"account_id"`
 	SystemIDs       []string `json:"system_ids"`
+	LogicalSystems  int      `json:"logical_systems"` // the ≤10/terminal cap unit (a multi-trader counts as len(symbols))
 }
 
 // LogPaths let the TUI tail raw logs directly (the engine does not proxy log bytes).

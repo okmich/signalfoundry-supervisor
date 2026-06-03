@@ -22,6 +22,9 @@ const (
 	colAge    = 8
 )
 
+// terminalCap is the ≤10 logical-systems-per-broker-terminal blast-radius cap (§7).
+const terminalCap = 10
+
 var (
 	titleStyle  = lipgloss.NewStyle().Bold(true)
 	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
@@ -208,7 +211,16 @@ func (m model) View() string {
 	if len(m.fleet.Systems) == 0 {
 		lines = append(lines, dimStyle.Render("  (no systems)"))
 	}
+	terms := make(map[string]ipc.Terminal, len(m.fleet.Terminals))
+	for _, t := range m.fleet.Terminals {
+		terms[t.BrokerSessionID] = t
+	}
+	prevSession := "\x00" // sentinel before any real session
 	for i, s := range m.fleet.Systems {
+		if s.SessionID != prevSession { // start of a terminal group -> subheader
+			prevSession = s.SessionID
+			lines = append(lines, m.terminalHeader(s.SessionID, terms))
+		}
 		lines = append(lines, m.systemRow(s, i == m.cursor))
 	}
 	lines = append(lines, "")
@@ -252,6 +264,25 @@ func (m model) systemRow(s ipc.System, selected bool) string {
 		row += wedgeStyle.Render("⚠ WEDGED")
 	}
 	return row
+}
+
+// terminalHeader is the blast-radius subheader for a broker session (§7): account + the N/10 cap,
+// reddened when over cap. Non-running systems group under an "— not running —" header.
+func (m model) terminalHeader(session string, terms map[string]ipc.Terminal) string {
+	if session == "" {
+		return dimStyle.Render("— not running —")
+	}
+	t := terms[session]
+	acct := t.Account
+	if acct == "" {
+		acct = "?"
+	}
+	capStr, capStyle := fmt.Sprintf("%d/%d systems", t.LogicalSystems, terminalCap), dimStyle
+	if t.LogicalSystems > terminalCap {
+		capStr += "  OVER CAP"
+		capStyle = alertStyle
+	}
+	return headerStyle.Render(fmt.Sprintf("terminal %s · %s · ", session, acct)) + capStyle.Render(capStr)
 }
 
 // titleBar renders "signalfoundry supervisor — <view>" with engine pid/clock/alert state, right-aligned

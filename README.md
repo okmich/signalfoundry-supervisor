@@ -24,10 +24,15 @@ delivering a `CTRL_C_EVENT` to its PID (reusing the system's existing Ctrl+C gra
 - **commands in:** the TUI drops `commands/<id>.json`; the engine polls, executes (it is the
   sole actor on systems), and writes `<id>.result.json`.
 
-## Env (required; fail-fast)
+## Env
 
-`OKMICH_QUANT_LIVE_BASE`, `OKMICH_QUANT_LOG_BASE`, `OKMICH_QUANT_ENV_DIR`,
+**Required (fail-fast):** `OKMICH_QUANT_LIVE_BASE`, `OKMICH_QUANT_LOG_BASE`, `OKMICH_QUANT_ENV_DIR`,
 `OKMICH_QUANT_SUPERVISOR_STATE_DIR`.
+
+**Optional:** `OKMICH_QUANT_PYTHON` (interpreter to spawn `run.py`, default `python`);
+`OKMICH_QUANT_GLOBAL_CONFIG` (the `.global` dir holding `notifier.env` for Telegram alerts);
+`OKMICH_QUANT_STOP_TIMEOUT` / `OKMICH_QUANT_START_TIMEOUT` (default `60s`);
+`OKMICH_QUANT_WEDGE_MULTIPLE` / `OKMICH_QUANT_WEDGE_GRACE` (wedge threshold seeds, default `3` / `1m`).
 
 ## Build
 
@@ -40,5 +45,30 @@ GOOS=windows GOARCH=amd64 go build ./cmd/supervisor   # the trader-box target
 Develop the engine/TUI/state logic on any OS — the Windows console control is behind a build
 tag (`proc/control_windows.go`), with a no-op stub elsewhere (`proc/stub_other.go`).
 
-> Status: scaffold. Load-bearing pieces are real (control, IPC types, engine loop, TUI shell);
-> reconcile/commands/registry wiring carry `TODO`s.
+## Implementation status
+
+MVP + most of the hardening pass are **implemented and tested** (unit tests across all packages +
+Windows integration scripts under `_dev/`; builds on windows/linux/darwin).
+
+**Done:**
+
+- **Discovery / reconcile** — config-driven (single vs multi-trader via `config.json`), state from
+  `status.json` + PID liveness + inference freshness, `logical_systems[]` coverage gate.
+- **Lifecycle control** — `stop` / `start` / `restart`, single **and** bulk (`*-all`, with a confirm
+  gate on fleet-wide stops), via targeted console Ctrl+C; hard-kill fallback → `orphan_suspected`;
+  start-failure → `Crashed`.
+- **Liveness + alerting** — `wedged` detection with an operator-tunable alert gate (`settings.json`,
+  live-read); Telegram alerts from `notifier.env`.
+- **Re-attach + registry (§12)** — create-time PID-reuse guard with a persistent identity baseline;
+  the engine re-attaches to running children on restart without relaunching.
+- **Blast-radius (§7)** — broker-terminal grouping + the ≤10-logical-systems cap.
+- **Multi-trader (§16)** — one runner row (`<strategy>-multi`), stopped as a unit.
+- **TUI** — color-coded fleet grouped by terminal, per-row + bulk control, confirm gate, a live
+  settings screen.
+
+**Deferred:**
+
+- Named-mutex singleton (a pidfile guards single-instance today).
+- Multi-trader runner-level liveness (stalest-symbol bar-age / wedge).
+- Real MT5 end-to-end validation (stand-ins prove the mechanism + engine logic).
+- Broker-session start gate (§13/§14) — MVP-deferred.

@@ -9,6 +9,7 @@ import (
 	"github.com/okmich/signalfoundry-supervisor/internal/ipc"
 	"github.com/okmich/signalfoundry-supervisor/internal/notify"
 	"github.com/okmich/signalfoundry-supervisor/internal/proc"
+	"github.com/okmich/signalfoundry-supervisor/internal/registry"
 )
 
 func TestParseTimeframe(t *testing.T) {
@@ -57,9 +58,9 @@ func TestIsFXWeekend(t *testing.T) {
 	}
 }
 
-func testEngine() *engine {
+func testEngine(t *testing.T) *engine {
 	return &engine{
-		cfg:         config.Config{WedgeMultiple: 3, WedgeGrace: time.Minute}, // M5 threshold = 16m
+		cfg:         config.Config{WedgeMultiple: 3, WedgeGrace: time.Minute, StateDir: t.TempDir()}, // M5 threshold = 16m
 		transitions: map[string]*transition{},
 		wedged:      map[string]bool{},
 		identities:  map[string]identity{},
@@ -68,7 +69,7 @@ func testEngine() *engine {
 }
 
 func TestCheckLivenessWedged(t *testing.T) {
-	e := testEngine()
+	e := testEngine(t)
 	now := time.Date(2026, 1, 7, 12, 0, 0, 0, time.UTC) // Wednesday — weekend gate off
 	set := ipc.Settings{WedgeAlert: ipc.WedgeAlertAlways, WedgeMultiple: 3, WedgeGraceS: 60}
 	systems := []ipc.System{
@@ -98,7 +99,7 @@ func TestCheckLivenessWedged(t *testing.T) {
 
 // surface_only still SETS the wedged flag (the flag is always surfaced; only the page is gated).
 func TestCheckLivenessSurfaceOnlyStillFlags(t *testing.T) {
-	e := testEngine()
+	e := testEngine(t)
 	now := time.Date(2026, 1, 7, 12, 0, 0, 0, time.UTC)
 	set := ipc.Settings{WedgeAlert: ipc.WedgeAlertSurface, WedgeMultiple: 3, WedgeGraceS: 60}
 	systems := []ipc.System{
@@ -110,25 +111,25 @@ func TestCheckLivenessSurfaceOnlyStillFlags(t *testing.T) {
 	}
 }
 
-// confirmIdentities downgrades a Running row whose PID's create-time no longer matches the recorded
+// reconcileIdentities downgrades a Running row whose PID's create-time no longer matches the recorded
 // baseline (the PID was recycled). Uses the test process's own PID, whose create-time is real and
 // stable; skips where CreateTime is unavailable (non-Windows).
-func TestConfirmIdentitiesDetectsReuse(t *testing.T) {
-	e := testEngine()
+func TestReconcileIdentitiesDetectsReuse(t *testing.T) {
+	e := testEngine(t)
 	pid := os.Getpid()
 	if _, ok := proc.CreateTime(pid); !ok {
 		t.Skip("proc.CreateTime unsupported on this platform")
 	}
-	e.identities["sys/X/M5"] = identity{pid: pid, ctime: time.Unix(1, 0)} // stale baseline
+	e.identities["sys/X/M5"] = identity{pid: pid, ctime: time.Unix(1, 0)} // stale (non-zero) baseline
 	systems := []ipc.System{{SystemID: "sys/X/M5", State: ipc.StateRunning, PID: pid}}
-	e.confirmIdentities(systems)
+	e.reconcileIdentities(systems)
 	if systems[0].State != ipc.StateOrphanSuspected {
 		t.Errorf("reused PID should be downgraded to OrphanSuspected, got %s", systems[0].State)
 	}
 }
 
-func TestConfirmIdentitiesConsistent(t *testing.T) {
-	e := testEngine()
+func TestReconcileIdentitiesConsistent(t *testing.T) {
+	e := testEngine(t)
 	pid := os.Getpid()
 	ct, ok := proc.CreateTime(pid)
 	if !ok {
@@ -136,9 +137,73 @@ func TestConfirmIdentitiesConsistent(t *testing.T) {
 	}
 	e.identities["sys/X/M5"] = identity{pid: pid, ctime: ct} // correct baseline
 	systems := []ipc.System{{SystemID: "sys/X/M5", State: ipc.StateRunning, PID: pid}}
-	e.confirmIdentities(systems)
+	e.reconcileIdentities(systems)
 	if systems[0].State != ipc.StateRunning {
 		t.Errorf("matching create-time should stay Running, got %s", systems[0].State)
+	}
+}
+
+// The identity baseline is persisted to the registry and re-loaded on (engine) restart, so a
+// re-attached system stays Running rather than tripping a false orphan (§12).
+func TestIdentityPersistsAndReattaches(t *testing.T) {
+	pid := os.Getpid()
+	if _, ok := proc.CreateTime(pid); !ok {
+		t.Skip("proc.CreateTime unsupported on this platform")
+	}
+	dir := t.TempDir()
+	newEngine := func() *engine {
+		return &engine{
+			cfg:         config.Config{StateDir: dir},
+			transitions: map[string]*transition{},
+			wedged:      map[string]bool{},
+			identities:  map[string]identity{},
+			notifier:    notify.FromEnvFile(""),
+		}
+	}
+	systems := []ipc.System{{SystemID: "sys/X/M5", State: ipc.StateRunning, PID: pid, StartToken: "tok-1"}}
+
+	e1 := newEngine()
+	e1.reconcileIdentities(systems) // records + persists
+	if reg, _ := registry.Load(e1.cfg.RegistryPath()); reg.Entries["sys/X/M5"].PID != pid {
+		t.Fatalf("identity not persisted to the registry")
+	}
+
+	// "restart": a fresh engine loads the registry and re-attaches without a false orphan.
+	e2 := newEngine()
+	e2.loadIdentities()
+	if e2.identities["sys/X/M5"].pid != pid {
+		t.Fatalf("identity not re-loaded on restart")
+	}
+	systems[0].State = ipc.StateRunning // reset (snapshot is fresh each tick)
+	e2.reconcileIdentities(systems)
+	if systems[0].State != ipc.StateRunning {
+		t.Errorf("re-attached system should stay Running (consistent create-time), got %s", systems[0].State)
+	}
+}
+
+func TestGroupTerminals(t *testing.T) {
+	systems := []ipc.System{
+		{SystemID: "a/X/5", State: ipc.StateRunning, SessionID: "mt5-1", Account: "A1"},
+		{SystemID: "b-multi", State: ipc.StateRunning, SessionID: "mt5-1", Account: "A1", Multi: true, Symbols: []string{"s1", "s2", "s3"}},
+		{SystemID: "c/Y/5", State: ipc.StateRunning, SessionID: "mt5-2", Account: "A2"},
+		{SystemID: "d/Z/5", State: ipc.StateStopped}, // no session -> not grouped, sorts last
+	}
+	terms := groupTerminals(systems)
+	byID := map[string]ipc.Terminal{}
+	for _, tm := range terms {
+		byID[tm.BrokerSessionID] = tm
+	}
+	if len(terms) != 2 {
+		t.Fatalf("got %d terminals, want 2 (the stopped system has no session)", len(terms))
+	}
+	if got := byID["mt5-1"].LogicalSystems; got != 4 { // 1 single + a 3-symbol multi
+		t.Errorf("mt5-1 logical systems = %d, want 4 (a multi counts as len(symbols))", got)
+	}
+	if got := byID["mt5-2"].LogicalSystems; got != 1 {
+		t.Errorf("mt5-2 logical systems = %d, want 1", got)
+	}
+	if systems[len(systems)-1].SystemID != "d/Z/5" {
+		t.Errorf("the idle (no-session) system should sort last, ended with %s", systems[len(systems)-1].SystemID)
 	}
 }
 

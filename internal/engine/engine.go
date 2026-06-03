@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -44,11 +45,13 @@ type transition struct {
 	deadline time.Time // current phase deadline
 }
 
-// identity is the (pid, create-time) the engine last confirmed for a Running system — the baseline
-// for the PID-reuse guard (§9). `reused` edge-triggers the alert.
+// identity is the (pid, create-time, start-token) the engine last confirmed for a Running system —
+// the baseline for the PID-reuse guard (§9), persisted to the registry so it survives an engine
+// restart (§12). `reused` edge-triggers the alert and is not persisted (it is re-derived on load).
 type identity struct {
 	pid    int
 	ctime  time.Time
+	token  string
 	reused bool
 }
 
@@ -92,6 +95,7 @@ func Run(cfg config.Config) error {
 		identities:  map[string]identity{},
 		notifier:    notify.FromEnvFile(cfg.NotifierEnvPath()),
 	}
+	e.loadIdentities() // re-attach baseline from the registry (validated against ground truth each tick)
 	if _, err := os.Stat(cfg.SettingsPath()); os.IsNotExist(err) {
 		if werr := ipc.WriteSettings(cfg.SettingsPath(), e.defaultSettings()); werr != nil {
 			log.Println("engine: seed settings:", werr)
@@ -111,13 +115,15 @@ func Run(cfg config.Config) error {
 			now := time.Now().UTC()
 			settings := e.loadSettings()
 			systems := state.Reconcile(cfg)
-			e.confirmIdentities(systems)            // PID-reuse guard: downgrade a Running row whose PID was recycled
+			e.reconcileIdentities(systems)          // PID-reuse guard + registry re-attach baseline (§9/§12)
 			e.processCommands(systems)              // fire new actions, register transitions, write results
 			e.applyTransitions(systems)             // overlay in-flight state, drive deadlines, clear on completion
 			e.checkLiveness(systems, now, settings) // flag wedged (alive but stale JSONL), alert on the edge
+			terminals := groupTerminals(systems)    // blast-radius grouping (§7); orders systems by terminal
 			fs := ipc.FleetState{
-				Engine:  ipc.EngineInfo{PID: os.Getpid(), StartedAt: startedAt, Version: Version, Alerts: e.notifier.Enabled()},
-				Systems: systems,
+				Engine:    ipc.EngineInfo{PID: os.Getpid(), StartedAt: startedAt, Version: Version, Alerts: e.notifier.Enabled()},
+				Systems:   systems,
+				Terminals: terminals,
 			}
 			if err := ipc.Publish(cfg.FleetStatePath(), fs); err != nil {
 				log.Println("engine: publish:", err)
@@ -375,40 +381,83 @@ func (e *engine) loadSettings() ipc.Settings {
 	return s.Normalized(def)
 }
 
-// confirmIdentities is the PID-reuse guard (§9): for each Running system it compares the live
-// process's creation time against the one first confirmed for that PID. A matching PID with a
-// CHANGED creation time means the OS recycled the PID for an unrelated process — so the row is
-// downgraded to OrphanSuspected and control is refused (the existing state==Running guards then
-// reject any stop/kill), preventing the supervisor from Ctrl+C/TerminateProcess-ing a stranger.
-//
-// Scope: this catches the steady-state case (a system the engine saw Running later dies and its PID
-// is reused). Adopting a system that was ALREADY stale+reused at engine startup needs the registry
-// baseline of §12 re-attach (a recorded create-time/start-token), which is still deferred. When
-// CreateTime is unavailable (non-Windows / no rights) the guard is a no-op (falls back to Alive).
-func (e *engine) confirmIdentities(systems []ipc.System) {
+// loadIdentities seeds the in-memory PID-reuse baseline from process_registry.json on startup, so a
+// restarted engine re-attaches to systems it already knew (§12). Each entry is then validated
+// against live ground truth on the first reconcileIdentities tick — a recycled PID is caught, a dead
+// one is dropped — so the registry is never trusted blindly.
+func (e *engine) loadIdentities() {
+	reg, err := registry.Load(e.cfg.RegistryPath())
+	if err != nil {
+		log.Printf("engine: registry load: %v", err)
+		return
+	}
+	for id, ent := range reg.Entries {
+		e.identities[id] = identity{pid: ent.PID, ctime: ent.CreateTime, token: ent.StartToken}
+	}
+	if len(reg.Entries) > 0 {
+		log.Printf("engine: loaded %d re-attach identities from registry", len(reg.Entries))
+	}
+}
+
+// reconcileIdentities is the PID-reuse guard (§9) + registry re-attach maintenance (§12). For each
+// Running system it confirms the live process's create-time against the recorded baseline: a changed
+// create-time on the same PID means the OS recycled it for an unrelated process, so the row is
+// downgraded to OrphanSuspected and control is refused (the state==Running guards then reject any
+// stop/kill). Genuine identities are recorded/refreshed; identities for systems no longer Running are
+// dropped. The registry mirrors this set and is rewritten only when it changes. When CreateTime is
+// unavailable (non-Windows / no rights) the guard is a no-op.
+func (e *engine) reconcileIdentities(systems []ipc.System) {
+	changed := false
+	live := make(map[string]bool, len(systems))
 	for i := range systems {
 		s := &systems[i]
 		if s.State != ipc.StateRunning || s.PID == 0 {
 			continue
 		}
+		live[s.SystemID] = true
 		ct, ok := proc.CreateTime(s.PID)
 		if !ok {
 			continue
 		}
 		prev, seen := e.identities[s.SystemID]
 		switch {
-		case !seen || prev.pid != s.PID:
-			e.identities[s.SystemID] = identity{pid: s.PID, ctime: ct} // first sight / new incarnation
-		case prev.ctime.Equal(ct):
-			// same PID, same process — consistent, nothing to do
-		default:
+		case !seen || prev.pid != s.PID || prev.ctime.IsZero():
+			// first sight / new incarnation / unknown baseline (e.g. an older registry) — trust + record
+			e.identities[s.SystemID] = identity{pid: s.PID, ctime: ct, token: s.StartToken}
+			changed = true
+		case !prev.ctime.Equal(ct):
 			s.State = ipc.StateOrphanSuspected
 			if !prev.reused {
 				e.alert(fmt.Sprintf("%s: pid %d reused by another process (create-time changed) — refusing control, orphan suspected", s.SystemID, s.PID))
 				prev.reused = true
 				e.identities[s.SystemID] = prev
 			}
+		case prev.token != s.StartToken && s.StartToken != "":
+			prev.token = s.StartToken // same process, start token learned/changed — refresh
+			e.identities[s.SystemID] = prev
+			changed = true
 		}
+	}
+	for id := range e.identities {
+		if !live[id] {
+			delete(e.identities, id)
+			changed = true
+		}
+	}
+	if changed {
+		e.persistIdentities()
+	}
+}
+
+// persistIdentities atomically writes the current identity set to process_registry.json so it
+// survives an engine restart (§12).
+func (e *engine) persistIdentities() {
+	reg := registry.Registry{Entries: make(map[string]registry.Entry, len(e.identities))}
+	for id, idn := range e.identities {
+		reg.Entries[id] = registry.Entry{SystemID: id, PID: idn.pid, StartToken: idn.token, CreateTime: idn.ctime}
+	}
+	if err := registry.Save(e.cfg.RegistryPath(), reg); err != nil {
+		log.Printf("engine: registry save: %v", err)
 	}
 }
 
@@ -502,34 +551,16 @@ func isFXWeekend(t time.Time) bool {
 	}
 }
 
-// launch spawns python run.py (own console) and records the spawn in the registry. The returned
-// PID is the spawned process; the authoritative control PID is status.json's pid once written.
-func (e *engine) launch(systemID, runPy string) (int, error) {
+// launch spawns python run.py (own console). The returned PID is the spawned process; the
+// authoritative control identity (real interpreter PID + create-time + start-token) is recorded by
+// reconcileIdentities once the system reaches Running via status.json — not at spawn time, since the
+// spawned PID may be a launcher/shim, not the interpreter that writes status.json.
+func (e *engine) launch(_, runPy string) (int, error) {
 	cmd, err := proc.Spawn(e.cfg.Python, runPy)
 	if err != nil {
 		return 0, err
 	}
-	pid := cmd.Process.Pid
-	e.recordSpawn(systemID, pid)
-	return pid, nil
-}
-
-// recordSpawn upserts the spawned system into process_registry.json (the re-attach source of
-// truth, §12 — reconciled against ground truth, never trusted blindly).
-func (e *engine) recordSpawn(systemID string, pid int) {
-	reg, err := registry.Load(e.cfg.RegistryPath())
-	if err != nil {
-		log.Printf("engine: registry load: %v", err)
-		return
-	}
-	strat, sym := "", ""
-	if parts := strings.SplitN(systemID, "/", 3); len(parts) >= 2 {
-		strat, sym = parts[0], parts[1]
-	}
-	reg.Entries[systemID] = registry.Entry{SystemID: systemID, PID: pid, Strategy: strat, Symbol: sym}
-	if err := registry.Save(e.cfg.RegistryPath(), reg); err != nil {
-		log.Printf("engine: registry save: %v", err)
-	}
+	return cmd.Process.Pid, nil
 }
 
 func isLiveOrInFlight(st ipc.State) bool {
@@ -555,4 +586,50 @@ func indexByID(systems []ipc.System) map[string]*ipc.System {
 		m[systems[i].SystemID] = &systems[i]
 	}
 	return m
+}
+
+// groupTerminals builds the blast-radius grouping (§7): running systems that share a broker session
+// die together. It orders `systems` in place by terminal (idle/non-running last) so the view can
+// render them grouped, and counts logical systems per terminal (the ≤10 cap unit — a multi-trader
+// is len(symbols) logical systems though one PID).
+func groupTerminals(systems []ipc.System) []ipc.Terminal {
+	sort.SliceStable(systems, func(i, j int) bool {
+		if ki, kj := groupKey(systems[i]), groupKey(systems[j]); ki != kj {
+			return ki < kj
+		}
+		return systems[i].SystemID < systems[j].SystemID
+	})
+	byID := map[string]*ipc.Terminal{}
+	var order []string
+	for i := range systems {
+		s := &systems[i]
+		if s.SessionID == "" {
+			continue
+		}
+		t := byID[s.SessionID]
+		if t == nil {
+			t = &ipc.Terminal{BrokerSessionID: s.SessionID, Account: s.Account}
+			byID[s.SessionID] = t
+			order = append(order, s.SessionID)
+		}
+		t.SystemIDs = append(t.SystemIDs, s.SystemID)
+		n := 1
+		if s.Multi {
+			n = len(s.Symbols)
+		}
+		t.LogicalSystems += n
+	}
+	out := make([]ipc.Terminal, 0, len(order))
+	for _, id := range order {
+		out = append(out, *byID[id])
+	}
+	return out
+}
+
+// groupKey orders systems by broker session; those without one (idle / not running) sort last.
+func groupKey(s ipc.System) string {
+	if s.SessionID == "" {
+		return "\xff"
+	}
+	return s.SessionID
 }

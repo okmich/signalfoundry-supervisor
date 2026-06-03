@@ -17,18 +17,26 @@ func TestViewRendersFleet(t *testing.T) {
 		fleet: ipc.FleetState{
 			Engine:    ipc.EngineInfo{PID: 31576, Alerts: true},
 			UpdatedAt: time.Date(2026, 6, 3, 18, 42, 39, 0, time.UTC),
+			Terminals: []ipc.Terminal{
+				{BrokerSessionID: "mt5-deriv-1", Account: "DEMO-123", LogicalSystems: 2,
+					SystemIDs: []string{"rsi2_mean_reversion/EURUSD/M5", "keras_direction/XAUUSD/H1"}},
+			},
+			// systems arrive ordered by terminal (engine sorts); idle/non-running last
 			Systems: []ipc.System{
-				{SystemID: "rsi2_mean_reversion/EURUSD/M5", State: ipc.StateRunning, PID: 48748, LastBarAgeS: 2},
+				{SystemID: "rsi2_mean_reversion/EURUSD/M5", State: ipc.StateRunning, PID: 48748, LastBarAgeS: 2, SessionID: "mt5-deriv-1", Account: "DEMO-123"},
+				{SystemID: "keras_direction/XAUUSD/H1", State: ipc.StateRunning, PID: 12044, LastBarAgeS: 312, Wedged: true, SessionID: "mt5-deriv-1", Account: "DEMO-123"},
 				{SystemID: "hmm_neutral/GBPUSD/M15", State: ipc.StateStoppedByOp},
-				{SystemID: "keras_direction/XAUUSD/H1", State: ipc.StateRunning, PID: 12044, LastBarAgeS: 312, Wedged: true},
 				{SystemID: "rsi2_mean_reversion/USDJPY/M5", State: ipc.StateOrphanSuspected, PID: 5512},
 			},
 		},
 		status: "rsi2_mean_reversion/EURUSD/M5 → stopping",
 	}
 	out := m.View()
-	// includes the short labels for the wide states (full enum names would overflow colState)
-	for _, want := range []string{"SYSTEM", "STATE", "BAR AGE", "rsi2_mean_reversion/EURUSD/M5", "WEDGED", "Stopped(op)", "Orphan?", "alerts"} {
+	for _, want := range []string{
+		"SYSTEM", "STATE", "BAR AGE",
+		"terminal mt5-deriv-1", "DEMO-123", "2/10 systems", "not running", // blast-radius grouping
+		"rsi2_mean_reversion/EURUSD/M5", "WEDGED", "Stopped(op)", "Orphan?", "alerts",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered view is missing %q", want)
 		}

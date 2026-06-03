@@ -32,6 +32,7 @@ type EngineInfo struct {
 	PID       int       `json:"pid"`
 	StartedAt time.Time `json:"started_at"`
 	Version   string    `json:"version"`
+	Alerts    bool      `json:"alerts"` // Telegram alerting enabled (creds present)
 }
 
 // Terminal groups the logical systems that share one broker session/account (die together).

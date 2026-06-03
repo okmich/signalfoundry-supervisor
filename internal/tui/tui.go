@@ -8,10 +8,61 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
 	"github.com/okmich/signalfoundry-supervisor/internal/ipc"
 )
+
+// Column widths for the fleet table (visible cells; lipgloss pads around color codes).
+const (
+	colSystem = 38
+	colState  = 12
+	colPID    = 8
+	colAge    = 8
+)
+
+var (
+	titleStyle  = lipgloss.NewStyle().Bold(true)
+	dimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	headerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Bold(true)
+	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
+	selStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
+	wedgeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
+	alertStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+	okStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+)
+
+// stateLabel is the short display badge for a state — the full enum names (StoppedByOperator,
+// OrphanSuspected, CrashLoopHalted) are wider than colState and would break column alignment.
+func stateLabel(st ipc.State) string {
+	switch st {
+	case ipc.StateStoppedByOp:
+		return "Stopped(op)"
+	case ipc.StateOrphanSuspected:
+		return "Orphan?"
+	case ipc.StateCrashLoopHalted:
+		return "CrashLoop"
+	default:
+		return string(st)
+	}
+}
+
+// stateStyle colors a lifecycle state by severity: green running, amber in-flight, red fault, dim idle.
+func stateStyle(st ipc.State) lipgloss.Style {
+	switch st {
+	case ipc.StateRunning:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true)
+	case ipc.StateStarting, ipc.StateStopping, ipc.StateRestarting:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	case ipc.StateCrashed, ipc.StateOrphanSuspected, ipc.StateCrashLoopHalted:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
+	case ipc.StateStoppedByOp:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color("12"))
+	default: // Stopped / unknown
+		return dimStyle
+	}
+}
 
 // Run starts the TUI program.
 func Run(cfg config.Config) error {
@@ -32,6 +83,8 @@ type model struct {
 	settingsOpen bool         // settings screen is showing
 	settings     ipc.Settings // editable copy (loaded on open, written on each change)
 	setCursor    int          // selected settings row (0=mode, 1=multiple, 2=grace)
+
+	width int // terminal width (from WindowSizeMsg), for right-aligning the title bar
 }
 
 // confirmState gates a fleet-wide stop behind an explicit y/n (§11.1: a fleet stop is only an
@@ -55,6 +108,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		return m, nil
 	case ipc.FleetState:
 		m.fleet, m.err = msg, nil
 		m.clampCursor()
@@ -140,39 +196,102 @@ func (m model) View() string {
 	if m.settingsOpen {
 		return m.settingsView()
 	}
-	var b strings.Builder
-	b.WriteString("signalfoundry supervisor — fleet\n")
-	if !m.fleet.UpdatedAt.IsZero() {
-		fmt.Fprintf(&b, "engine pid %d · updated %s\n", m.fleet.Engine.PID, m.fleet.UpdatedAt.Format("15:04:05"))
-	}
-	b.WriteString("\n")
+	lines := []string{m.titleBar("fleet"), ""}
 	if m.err != nil {
-		fmt.Fprintf(&b, "engine offline? %v\n\n", m.err)
+		lines = append(lines, alertStyle.Render("engine offline? ")+dimStyle.Render(m.err.Error()), "")
 	}
+	lines = append(lines, "  "+
+		headerStyle.Width(colSystem).Render("SYSTEM")+
+		headerStyle.Width(colState).Render("STATE")+
+		headerStyle.Width(colPID).Render("PID")+
+		headerStyle.Width(colAge).Render("BAR AGE"))
 	if len(m.fleet.Systems) == 0 {
-		b.WriteString("(no systems)\n")
+		lines = append(lines, dimStyle.Render("  (no systems)"))
 	}
 	for i, s := range m.fleet.Systems {
-		cursor := "  "
-		if i == m.cursor {
-			cursor = "> "
-		}
-		flag := ""
-		if s.Wedged {
-			flag = "  [WEDGED]"
-		}
-		fmt.Fprintf(&b, "%s%-44s %-18s pid=%-7d bar_age=%4.0fs%s\n", cursor, s.SystemID, s.State, s.PID, s.LastBarAgeS, flag)
+		lines = append(lines, m.systemRow(s, i == m.cursor))
 	}
-	b.WriteString("\n")
+	lines = append(lines, "")
 	if m.confirm != nil {
-		fmt.Fprintf(&b, "** %s ALL %d running system(s)?  [y] confirm   [any other key] cancel **\n",
-			strings.ToUpper(m.confirm.action), m.confirm.count)
+		lines = append(lines, alertStyle.Render(fmt.Sprintf("%s ALL %d running system(s)?  [y] confirm   [any other key] cancel",
+			strings.ToUpper(m.confirm.action), m.confirm.count)))
 	}
 	if m.status != "" {
-		fmt.Fprintf(&b, "%s\n", m.status)
+		lines = append(lines, m.statusStyle().Render(m.status))
 	}
-	b.WriteString("\n[↑/↓] select  [s]tart [x]stop [r]restart  [S]/[X]/[R]=all  [c]onfig  [q]uit\n")
-	return b.String()
+	lines = append(lines, "", dimStyle.Render("↑/↓ select · s start · x stop · r restart · S/X/R all · c config · q quit"))
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// systemRow renders one fleet line: cursor + system id + colored state badge + pid + bar age + wedged.
+func (m model) systemRow(s ipc.System, selected bool) string {
+	cursor := "  "
+	idStyle := lipgloss.NewStyle()
+	if selected {
+		cursor = cursorStyle.Render("▸ ")
+		idStyle = selStyle
+	}
+	pid := "–"
+	if s.PID != 0 {
+		pid = fmt.Sprintf("%d", s.PID)
+	}
+	age := "–"
+	if s.State == ipc.StateRunning {
+		age = fmt.Sprintf("%.0fs", s.LastBarAgeS)
+	}
+	row := cursor +
+		idStyle.Width(colSystem).Render(truncate(s.SystemID, colSystem)) +
+		stateStyle(s.State).Width(colState).Render(stateLabel(s.State)) +
+		dimStyle.Width(colPID).Render(pid) +
+		dimStyle.Width(colAge).Render(age)
+	if s.Wedged {
+		row += wedgeStyle.Render("⚠ WEDGED")
+	}
+	return row
+}
+
+// titleBar renders "signalfoundry supervisor — <view>" with engine pid/clock/alert state, right-aligned
+// to the terminal width when known.
+func (m model) titleBar(view string) string {
+	left := titleStyle.Render("signalfoundry supervisor") + dimStyle.Render(" — "+view)
+	if m.fleet.UpdatedAt.IsZero() {
+		return left + dimStyle.Render("   (waiting for engine…)")
+	}
+	alerts := dimStyle.Render("alerts off")
+	if m.fleet.Engine.Alerts {
+		alerts = okStyle.Render("alerts ✓")
+	}
+	right := dimStyle.Render(fmt.Sprintf("engine %d · %s · ", m.fleet.Engine.PID, m.fleet.UpdatedAt.Format("15:04:05"))) + alerts
+	gap := 3
+	if m.width > 0 {
+		if g := m.width - lipgloss.Width(left) - lipgloss.Width(right); g > gap {
+			gap = g
+		}
+	}
+	return left + strings.Repeat(" ", gap) + right
+}
+
+func (m model) statusStyle() lipgloss.Style {
+	if strings.Contains(m.status, "REJECTED") || strings.Contains(m.status, "failed") {
+		return alertStyle
+	}
+	return okStyle
+}
+
+// truncate shortens s to w runes with a trailing ellipsis (rune-safe so a non-ASCII id is never
+// split mid-rune). Note: assumes single-width runes — fine for system ids.
+func truncate(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= w {
+		return s
+	}
+	if w == 1 {
+		return "…"
+	}
+	return string(r[:w-1]) + "…"
 }
 
 // --- actions -----------------------------------------------------------------
@@ -306,26 +425,28 @@ func (m *model) settingsAdjust(delta int) {
 }
 
 func (m model) settingsView() string {
-	var b strings.Builder
-	b.WriteString("signalfoundry supervisor — settings\n\n")
 	rows := []struct{ label, val, hint string }{
 		{"wedge alert", string(m.settings.WedgeAlert), "always | weekend | surface_only"},
 		{"wedge multiple", fmt.Sprintf("%d bars", m.settings.WedgeMultiple), "missed bar intervals before wedged"},
 		{"wedge grace", fmt.Sprintf("%ds", m.settings.WedgeGraceS), "slack added to N×timeframe"},
 	}
+	lines := []string{m.titleBar("settings"), ""}
 	for i, r := range rows {
-		cursor := "  "
+		cursor, labelStyle := "  ", dimStyle
 		if i == m.setCursor {
-			cursor = "> "
+			cursor, labelStyle = cursorStyle.Render("▸ "), selStyle
 		}
-		fmt.Fprintf(&b, "%s%-16s %-16s %s\n", cursor, r.label+":", r.val, r.hint)
+		lines = append(lines, cursor+
+			labelStyle.Width(18).Render(r.label)+
+			okStyle.Width(16).Render(r.val)+
+			dimStyle.Render(r.hint))
 	}
-	b.WriteString("\n")
+	lines = append(lines, "")
 	if m.status != "" {
-		fmt.Fprintf(&b, "%s\n", m.status)
+		lines = append(lines, m.statusStyle().Render(m.status))
 	}
-	b.WriteString("\n[↑/↓] select   [←/→ or -/+] change (auto-saved)   [esc] back\n")
-	return b.String()
+	lines = append(lines, "", dimStyle.Render("↑/↓ select · ←/→ or -/+ change (auto-saved) · esc back"))
+	return strings.Join(lines, "\n") + "\n"
 }
 
 // --- polling -----------------------------------------------------------------

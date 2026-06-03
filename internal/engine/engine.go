@@ -116,7 +116,7 @@ func Run(cfg config.Config) error {
 			e.applyTransitions(systems)             // overlay in-flight state, drive deadlines, clear on completion
 			e.checkLiveness(systems, now, settings) // flag wedged (alive but stale JSONL), alert on the edge
 			fs := ipc.FleetState{
-				Engine:  ipc.EngineInfo{PID: os.Getpid(), StartedAt: startedAt, Version: Version},
+				Engine:  ipc.EngineInfo{PID: os.Getpid(), StartedAt: startedAt, Version: Version, Alerts: e.notifier.Enabled()},
 				Systems: systems,
 			}
 			if err := ipc.Publish(cfg.FleetStatePath(), fs); err != nil {

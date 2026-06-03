@@ -3,10 +3,38 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
 	"github.com/okmich/signalfoundry-supervisor/internal/ipc"
 )
+
+func TestViewRendersFleet(t *testing.T) {
+	m := model{
+		cfg:     config.Config{StateDir: t.TempDir()},
+		pending: map[string]pendingCmd{},
+		width:   92,
+		fleet: ipc.FleetState{
+			Engine:    ipc.EngineInfo{PID: 31576, Alerts: true},
+			UpdatedAt: time.Date(2026, 6, 3, 18, 42, 39, 0, time.UTC),
+			Systems: []ipc.System{
+				{SystemID: "rsi2_mean_reversion/EURUSD/M5", State: ipc.StateRunning, PID: 48748, LastBarAgeS: 2},
+				{SystemID: "hmm_neutral/GBPUSD/M15", State: ipc.StateStoppedByOp},
+				{SystemID: "keras_direction/XAUUSD/H1", State: ipc.StateRunning, PID: 12044, LastBarAgeS: 312, Wedged: true},
+				{SystemID: "rsi2_mean_reversion/USDJPY/M5", State: ipc.StateOrphanSuspected, PID: 5512},
+			},
+		},
+		status: "rsi2_mean_reversion/EURUSD/M5 → stopping",
+	}
+	out := m.View()
+	// includes the short labels for the wide states (full enum names would overflow colState)
+	for _, want := range []string{"SYSTEM", "STATE", "BAR AGE", "rsi2_mean_reversion/EURUSD/M5", "WEDGED", "Stopped(op)", "Orphan?", "alerts"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered view is missing %q", want)
+		}
+	}
+	t.Log("\n" + out)
+}
 
 func testModel(t *testing.T) model {
 	t.Helper()

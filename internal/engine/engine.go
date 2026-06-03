@@ -544,7 +544,7 @@ func scanCatalog(liveBase string) map[string]discovery.System {
 	cat, _ := discovery.Scan(liveBase)
 	m := make(map[string]discovery.System, len(cat))
 	for _, c := range cat {
-		m[c.Strategy+"/"+c.Symbol+"/"+c.Timeframe] = c
+		m[c.SystemID] = c
 	}
 	return m
 }

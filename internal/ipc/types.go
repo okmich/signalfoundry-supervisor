@@ -53,7 +53,9 @@ type System struct {
 	SystemID    string    `json:"system_id"`
 	Strategy    string    `json:"strategy"`
 	Symbol      string    `json:"symbol"`
-	Timeframe   string    `json:"timeframe"` // the directory label, e.g. "M5" (not minutes)
+	Timeframe   string    `json:"timeframe"`         // the directory label, e.g. "M5" (not minutes)
+	Multi       bool      `json:"multi,omitempty"`   // a multi-trader runner (one PID, N symbols, §16)
+	Symbols     []string  `json:"symbols,omitempty"` // multi only: the logical-system symbols it carries
 	State       State     `json:"state"`
 	PID         int       `json:"pid,omitempty"`
 	StartToken  string    `json:"runner_start_token,omitempty"`

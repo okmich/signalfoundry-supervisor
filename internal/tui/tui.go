@@ -236,11 +236,15 @@ func (m model) systemRow(s ipc.System, selected bool) string {
 		pid = fmt.Sprintf("%d", s.PID)
 	}
 	age := "–"
-	if s.State == ipc.StateRunning {
+	if s.State == ipc.StateRunning && !s.Multi { // a multi runner is one row; per-symbol bar-age isn't shown
 		age = fmt.Sprintf("%.0fs", s.LastBarAgeS)
 	}
+	id := s.SystemID
+	if s.Multi {
+		id += fmt.Sprintf(" ·%dsym", len(s.Symbols))
+	}
 	row := cursor +
-		idStyle.Width(colSystem).Render(truncate(s.SystemID, colSystem)) +
+		idStyle.Width(colSystem).Render(truncate(id, colSystem)) +
 		stateStyle(s.State).Width(colState).Render(stateLabel(s.State)) +
 		dimStyle.Width(colPID).Render(pid) +
 		dimStyle.Width(colAge).Render(age)

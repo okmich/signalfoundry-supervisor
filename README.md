@@ -62,13 +62,15 @@ Windows integration scripts under `_dev/`; builds on windows/linux/darwin).
 - **Re-attach + registry (§12)** — create-time PID-reuse guard with a persistent identity baseline;
   the engine re-attaches to running children on restart without relaunching.
 - **Blast-radius (§7)** — broker-terminal grouping + the ≤10-logical-systems cap.
-- **Multi-trader (§16)** — one runner row (`<strategy>-multi`), stopped as a unit.
+- **Multi-trader (§16)** — one runner row (`<strategy>-multi`), stopped as a unit, with
+  **runner-level liveness**: one wedge clock per logical system, each judged at its own cadence
+  (the row wedges if any leg is stale; the fleet view shows the stalest leg's bar-age).
+- **Singleton** — a deployment-specific Windows named mutex (state-dir-hashed, OS-freed on exit, no
+  stale-pidfile race); the pidfile remains for observability / the non-Windows guard.
 - **TUI** — color-coded fleet grouped by terminal, per-row + bulk control, confirm gate, a live
   settings screen.
 
 **Deferred:**
 
-- Named-mutex singleton (a pidfile guards single-instance today).
-- Multi-trader runner-level liveness (stalest-symbol bar-age / wedge).
 - Real MT5 end-to-end validation (stand-ins prove the mechanism + engine logic).
 - Broker-session start gate (§13/§14) — MVP-deferred.

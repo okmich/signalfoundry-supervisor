@@ -43,6 +43,17 @@ type Terminal struct {
 	LogicalSystems  int      `json:"logical_systems"` // the ≤10/terminal cap unit (a multi-trader counts as len(symbols))
 }
 
+// SystemLeg is one logical system's liveness clock inside a multi-trader runner (§16). A single-
+// trader has no legs — its own Timeframe/LastBarTS is the clock; a multi-trader carries one leg per
+// symbol so the runner is judged wedged if ANY leg is stale past its OWN cadence (§15), which a
+// single per-row timeframe cannot express when the basket mixes cadences.
+type SystemLeg struct {
+	Symbol    string    `json:"symbol"`
+	Timeframe string    `json:"timeframe"`
+	Inference string    `json:"inference,omitempty"` // this symbol's inference dir (the TUI Glance tail, §15)
+	LastBarTS time.Time `json:"last_bar_ts"`
+}
+
 // LogPaths let the TUI tail raw logs directly (the engine does not proxy log bytes).
 type LogPaths struct {
 	Inference string `json:"inference"`
@@ -51,22 +62,23 @@ type LogPaths struct {
 }
 
 type System struct {
-	SystemID    string    `json:"system_id"`
-	Strategy    string    `json:"strategy"`
-	Symbol      string    `json:"symbol"`
-	Timeframe   string    `json:"timeframe"`         // the directory label, e.g. "M5" (not minutes)
-	Multi       bool      `json:"multi,omitempty"`   // a multi-trader runner (one PID, N symbols, §16)
-	Symbols     []string  `json:"symbols,omitempty"` // multi only: the logical-system symbols it carries
-	State       State     `json:"state"`
-	PID         int       `json:"pid,omitempty"`
-	StartToken  string    `json:"runner_start_token,omitempty"`
-	Broker      string    `json:"broker,omitempty"`
-	Account     string    `json:"account_id,omitempty"`
-	SessionID   string    `json:"broker_session_id,omitempty"`
-	LastBarTS   time.Time `json:"last_bar_ts"`
-	LastBarAgeS float64   `json:"last_bar_age_s"`   // liveness: seconds since last bar
-	Wedged      bool      `json:"wedged,omitempty"` // alive but JSONL stale past threshold (§15); orthogonal to State
-	LogPaths    LogPaths  `json:"log_paths"`
+	SystemID    string      `json:"system_id"`
+	Strategy    string      `json:"strategy"`
+	Symbol      string      `json:"symbol"`
+	Timeframe   string      `json:"timeframe"`         // the directory label, e.g. "M5" (not minutes)
+	Multi       bool        `json:"multi,omitempty"`   // a multi-trader runner (one PID, N symbols, §16)
+	Symbols     []string    `json:"symbols,omitempty"` // multi only: the logical-system symbols it carries
+	Legs        []SystemLeg `json:"legs,omitempty"`    // multi only: per-symbol liveness clocks (§15 runner-level liveness)
+	State       State       `json:"state"`
+	PID         int         `json:"pid,omitempty"`
+	StartToken  string      `json:"runner_start_token,omitempty"`
+	Broker      string      `json:"broker,omitempty"`
+	Account     string      `json:"account_id,omitempty"`
+	SessionID   string      `json:"broker_session_id,omitempty"`
+	LastBarTS   time.Time   `json:"last_bar_ts"`
+	LastBarAgeS float64     `json:"last_bar_age_s"`   // liveness: seconds since last bar
+	Wedged      bool        `json:"wedged,omitempty"` // alive but JSONL stale past threshold (§15); orthogonal to State
+	LogPaths    LogPaths    `json:"log_paths"`
 }
 
 // Command is what the TUI drops for the engine: commands/<id>.json.

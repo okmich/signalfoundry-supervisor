@@ -111,6 +111,56 @@ func TestCheckLivenessSurfaceOnlyStillFlags(t *testing.T) {
 	}
 }
 
+// A multi-trader runner is wedged if ANY of its legs is stale; recovers only when every leg is fresh.
+func TestCheckLivenessMultiLegWedged(t *testing.T) {
+	e := testEngine(t)
+	now := time.Date(2026, 1, 7, 12, 0, 0, 0, time.UTC) // Wednesday — weekend gate off
+	set := ipc.Settings{WedgeAlert: ipc.WedgeAlertAlways, WedgeMultiple: 3, WedgeGraceS: 60}
+	systems := []ipc.System{{
+		SystemID: "basket-multi", State: ipc.StateRunning, PID: 7, Multi: true,
+		Legs: []ipc.SystemLeg{
+			{Symbol: "EURUSD", Timeframe: "5", LastBarTS: now.Add(-2 * time.Minute)}, // fresh (M5 thr 16m)
+			{Symbol: "GBPUSD", Timeframe: "5", LastBarTS: now.Add(-1 * time.Hour)},   // stale -> wedges runner
+		},
+	}}
+	e.checkLiveness(systems, now, set)
+	if !systems[0].Wedged {
+		t.Fatalf("a multi-trader with one stale leg should be wedged")
+	}
+	if !e.wedged["basket-multi"] {
+		t.Errorf("engine should track basket-multi as wedged")
+	}
+	// Recovery requires EVERY leg fresh — clearing only the stale leg should clear the flag.
+	systems[0].Legs[1].LastBarTS = now.Add(-1 * time.Minute)
+	e.checkLiveness(systems, now, set)
+	if systems[0].Wedged || e.wedged["basket-multi"] {
+		t.Errorf("multi should recover once every leg is fresh")
+	}
+}
+
+// Each leg is held to its OWN cadence: an H1 leg 30m old is fine; a 5m leg 30m old is wedged.
+func TestCheckLivenessMultiLegPerCadence(t *testing.T) {
+	e := testEngine(t)
+	now := time.Date(2026, 1, 7, 12, 0, 0, 0, time.UTC)
+	set := ipc.Settings{WedgeAlert: ipc.WedgeAlertAlways, WedgeMultiple: 3, WedgeGraceS: 60}
+	systems := []ipc.System{{
+		SystemID: "mixed-multi", State: ipc.StateRunning, PID: 9, Multi: true,
+		Legs: []ipc.SystemLeg{
+			{Symbol: "SLOW", Timeframe: "60", LastBarTS: now.Add(-30 * time.Minute)}, // H1: 30m < 181m thr
+		},
+	}}
+	e.checkLiveness(systems, now, set)
+	if systems[0].Wedged {
+		t.Errorf("an H1 leg 30m old is within its threshold; runner should not be wedged")
+	}
+	// A 5m leg 30m old exceeds its own 16m threshold -> the runner wedges on it.
+	systems[0].Legs = append(systems[0].Legs, ipc.SystemLeg{Symbol: "FAST", Timeframe: "5", LastBarTS: now.Add(-30 * time.Minute)})
+	e.checkLiveness(systems, now, set)
+	if !systems[0].Wedged {
+		t.Errorf("a 5m leg 30m old exceeds its 16m threshold; runner should be wedged")
+	}
+}
+
 // reconcileIdentities downgrades a Running row whose PID's create-time no longer matches the recorded
 // baseline (the PID was recycled). Uses the test process's own PID, whose create-time is real and
 // stable; skips where CreateTime is unavailable (non-Windows).

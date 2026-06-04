@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +44,92 @@ func TestViewRendersFleet(t *testing.T) {
 		}
 	}
 	t.Log("\n" + out)
+}
+
+func TestTailFileLastLines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inference_x.jsonl")
+	if err := os.WriteFile(path, []byte("a\nb\n\nc\nd\n"), 0o644); err != nil { // blank line ignored
+		t.Fatal(err)
+	}
+	got, err := tailFile(path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "c" || got[1] != "d" {
+		t.Errorf("tailFile last-2 = %v, want [c d]", got)
+	}
+	if lines, err := tailFile(filepath.Join(dir, "nope.jsonl"), 5); err != nil || lines != nil {
+		t.Errorf("missing file = (%v,%v), want (nil,nil) — a not-yet-written day is not an error", lines, err)
+	}
+}
+
+// The Glance screen resolves a single-trader's inference dir to today's JSONL and renders its tail.
+func TestLogViewTailsSelectedSystem(t *testing.T) {
+	root := t.TempDir()
+	day := time.Now().UTC().Format("20060102")
+	infDir := filepath.Join(root, "rsi2", "EURUSD", "5", "inference")
+	if err := os.MkdirAll(infDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bar := `{"event":"bar","asof_bar_ts":"2026-06-04T12:00:00Z","close":1.2345}`
+	if err := os.WriteFile(filepath.Join(infDir, "inference_"+day+".jsonl"), []byte(bar+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := model{
+		cfg: config.Config{StateDir: t.TempDir()}, pending: map[string]pendingCmd{},
+		width: 120, height: 30,
+		fleet: ipc.FleetState{Systems: []ipc.System{
+			{SystemID: "rsi2/EURUSD/M5", State: ipc.StateRunning, PID: 1, LogPaths: ipc.LogPaths{Inference: infDir}},
+		}},
+	}
+	m.cursor = 0
+	m.openLog()
+	if !m.logOpen {
+		t.Fatal("openLog should open the Glance screen for a system with an inference dir")
+	}
+	if m.logDir != infDir {
+		t.Fatalf("logDir = %q, want the inference dir %q", m.logDir, infDir)
+	}
+	// Resolve + tail today's file the way a tick read does (the file is resolved per read, not at open).
+	path := filepath.Join(m.logDir, "inference_"+day+".jsonl")
+	lines, err := tailFile(path, logTailMax)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.logPath, m.logLines = path, lines
+	out := m.logView()
+	for _, want := range []string{"rsi2/EURUSD/M5", "asof_bar_ts", "1.2345", "live tail"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log view missing %q\n%s", want, out)
+		}
+	}
+}
+
+// For a multi-trader the Glance screen watches the STALEST leg (usually the wedged symbol).
+func TestOpenLogPicksStalestMultiLeg(t *testing.T) {
+	now := time.Now().UTC()
+	m := model{
+		pending: map[string]pendingCmd{},
+		fleet: ipc.FleetState{Systems: []ipc.System{{
+			SystemID: "basket-multi", State: ipc.StateRunning, PID: 7, Multi: true,
+			Legs: []ipc.SystemLeg{
+				{Symbol: "EURUSD", Inference: filepath.Join("log", "EURUSD"), LastBarTS: now.Add(-2 * time.Minute)},
+				{Symbol: "GBPUSD", Inference: filepath.Join("log", "GBPUSD"), LastBarTS: now.Add(-1 * time.Hour)},
+			},
+		}}},
+	}
+	m.cursor = 0
+	m.openLog()
+	if !m.logOpen {
+		t.Fatal("openLog should open for a multi-trader")
+	}
+	if !strings.Contains(m.logTitle, "GBPUSD") {
+		t.Errorf("multi Glance should target the stalest leg GBPUSD, title=%q", m.logTitle)
+	}
+	if !strings.Contains(m.logDir, "GBPUSD") {
+		t.Errorf("logDir should point at the stalest leg dir, got %q", m.logDir)
+	}
 }
 
 func testModel(t *testing.T) model {

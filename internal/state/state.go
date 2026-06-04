@@ -4,6 +4,7 @@ package state
 
 import (
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
@@ -16,14 +17,14 @@ import (
 // Reconcile builds the live fleet picture: discover the catalog, read each system's status.json,
 // verify the PID, classify state. It NEVER relaunches (adoption only, FLEET_SUPERVISOR_SPEC §12).
 //
-// A row only adopts a runner's PID/state if its symbol is in the runner's logical_systems[] — one
-// runner-root status.json covers several symbol/timeframe rows, so applying it blindly would let a
-// row that the runner does NOT cover inherit a live PID and become a wrong stop/kill target.
+// A single-trader row only adopts a runner's PID/state if its symbol is in the runner's
+// logical_systems[] — one runner-root status.json covers several symbol/timeframe rows, so applying
+// it blindly would let a row the runner does NOT cover inherit a live PID and become a wrong
+// stop/kill target. A multi-trader is its own runner root (<strategy>-multi, resolved by discovery)
+// and is adopted as a unit, with one liveness leg per logical system (runner-level liveness, §15).
 //
-// TODO: resolve the runner-root strategy (the `-multi` suffix) — a multi-trader reports under
-// <strategy>-multi; this assumes the single-trader <strategy>. TODO: match coverage by timeframe
-// too (status.json timeframe is an int, the row label is a string), blast-radius grouping (§7),
-// wedged-vs-live grace, and registry reconciliation.
+// TODO: match coverage by timeframe too (status.json timeframe is an int, the row label a string) —
+// today runnerCovers gates on symbol only.
 func Reconcile(cfg config.Config) []ipc.System {
 	cat, _ := discovery.Scan(cfg.LiveBase)
 	systems := make([]ipc.System, 0, len(cat))
@@ -50,13 +51,27 @@ func Reconcile(cfg config.Config) []ipc.System {
 			switch {
 			case rs.State == "running" && proc.Alive(rs.PID):
 				s.State = ipc.StateRunning
-				// Per-symbol bar-age/wedged is shown for single-traders only; a multi-trader is a
-				// single runner row, so runner-level liveness (stalest symbol) is deferred.
-				if !c.Multi {
-					if ts, ok := contract.LastBarTS(s.LogPaths.Inference); ok {
-						s.LastBarTS = ts
-						s.LastBarAgeS = time.Since(ts).Seconds()
+				if c.Multi {
+					// Runner-level liveness: one leg per logical system (its own symbol + timeframe),
+					// taken from status.json's logical_systems[] — the authoritative symbol/timeframe
+					// map, since the config.json discovery reads carries no timeframe. The engine
+					// judges the runner wedged if ANY leg is stale past its OWN cadence (§15); the
+					// row's bar-age shows the STALEST leg so the fleet view flags the worst symbol.
+					s.Legs = multiLegs(cfg.LogBase, c.RunnerStrategy, rs.LogicalSystems)
+					for _, leg := range s.Legs {
+						if leg.LastBarTS.IsZero() {
+							continue
+						}
+						if s.LastBarTS.IsZero() || leg.LastBarTS.Before(s.LastBarTS) {
+							s.LastBarTS = leg.LastBarTS
+						}
 					}
+					if !s.LastBarTS.IsZero() {
+						s.LastBarAgeS = time.Since(s.LastBarTS).Seconds()
+					}
+				} else if ts, ok := contract.LastBarTS(s.LogPaths.Inference); ok {
+					s.LastBarTS = ts
+					s.LastBarAgeS = time.Since(ts).Seconds()
 				}
 			case rs.State == "running" && !proc.Alive(rs.PID):
 				s.State = ipc.StateOrphanSuspected
@@ -67,6 +82,27 @@ func Reconcile(cfg config.Config) []ipc.System {
 		systems = append(systems, s)
 	}
 	return systems
+}
+
+// multiLegs builds one liveness leg per logical system of a multi-trader, reading each symbol's own
+// inference dir at its own timeframe. status.json carries the timeframe as integer minutes, which is
+// both the path label (e.g. "5") and what the engine's parseTimeframe expects. A leg with no bar yet
+// has a zero LastBarTS and is simply not judged for wedging (§15).
+func multiLegs(logBase, runnerStrategy string, ls []contract.LogicalSystem) []ipc.SystemLeg {
+	if len(ls) == 0 {
+		return nil
+	}
+	legs := make([]ipc.SystemLeg, 0, len(ls))
+	for _, l := range ls {
+		tf := strconv.Itoa(l.Timeframe)
+		dir := contract.InferenceDir(logBase, runnerStrategy, l.Symbol, tf)
+		leg := ipc.SystemLeg{Symbol: l.Symbol, Timeframe: tf, Inference: dir}
+		if ts, ok := contract.LastBarTS(dir); ok {
+			leg.LastBarTS = ts
+		}
+		legs = append(legs, leg)
+	}
+	return legs
 }
 
 // runnerCovers reports whether the runner's status.json claims this symbol. An empty logical_systems

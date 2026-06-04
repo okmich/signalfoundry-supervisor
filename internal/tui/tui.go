@@ -4,6 +4,9 @@ package tui
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -87,7 +90,15 @@ type model struct {
 	settings     ipc.Settings // editable copy (loaded on open, written on each change)
 	setCursor    int          // selected settings row (0=mode, 1=multiple, 2=grace)
 
-	width int // terminal width (from WindowSizeMsg), for right-aligning the title bar
+	logOpen  bool     // the live log-tail (Glance, §15) screen is showing
+	logDir   string   // inference dir being watched (the identity; today's file is resolved per read)
+	logPath  string   // dated JSONL file last read (display only), set from logTailMsg
+	logTitle string   // header label for the tail screen
+	logLines []string // latest tail of logPath
+	logErr   error    // last tail-read error, if any
+
+	width  int // terminal width (from WindowSizeMsg), for right-aligning the title bar
+	height int // terminal height, to bound the log-tail viewport
 }
 
 // confirmState gates a fleet-wide stop behind an explicit y/n (§11.1: a fleet stop is only an
@@ -105,6 +116,16 @@ type pendingCmd struct {
 type tickMsg time.Time
 type errMsg struct{ err error }
 
+// logTailMsg carries a fresh tail of the file being watched in the Glance screen (§15). dir is the
+// read's identity (so a late-arriving read for a dir we've stopped watching is discarded); path is
+// the dated file actually read, resolved per read so the tail follows the UTC-midnight rollover.
+type logTailMsg struct {
+	dir   string
+	path  string
+	lines []string
+	err   error
+}
+
 func (m model) Init() tea.Cmd { return tea.Batch(poll(m.cfg), tick()) }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -112,7 +133,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
+		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 	case ipc.FleetState:
 		m.fleet, m.err = msg, nil
@@ -121,9 +142,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.err = msg.err
 		return m, nil
+	case logTailMsg:
+		if m.logOpen && msg.dir == m.logDir { // ignore a read for a dir we've since stopped watching
+			m.logPath, m.logLines, m.logErr = msg.path, msg.lines, msg.err
+		}
+		return m, nil
 	case tickMsg:
 		m.resolvePending()
-		return m, tea.Batch(poll(m.cfg), tick())
+		cmds := []tea.Cmd{poll(m.cfg), tick()}
+		if m.logOpen && m.logDir != "" { // keep the Glance tail live alongside the fleet poll
+			cmds = append(cmds, readLogTail(m.logDir))
+		}
+		return m, tea.Batch(cmds...)
 	}
 	return m, nil
 }
@@ -131,6 +161,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.settingsOpen {
 		return m.handleSettingsKey(k)
+	}
+	if m.logOpen {
+		return m.handleLogKey(k)
 	}
 	// While a bulk stop is pending confirmation, only y/Y proceeds; anything else cancels.
 	if m.confirm != nil {
@@ -167,6 +200,24 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.armBulkConfirm("restart")
 	case "c": // open the settings screen
 		m.openSettings()
+	case "l", "enter": // open the live log-tail (Glance, §15) for the selected row
+		m.openLog()
+		if m.logOpen {
+			return m, readLogTail(m.logDir)
+		}
+	}
+	return m, nil
+}
+
+// handleLogKey drives the live log-tail screen: esc/l/enter/q return to the fleet view (the tail
+// keeps refreshing only while it is open), ctrl+c quits.
+func (m model) handleLogKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch k.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc", "l", "enter", "q":
+		m.logOpen = false
+		m.logDir, m.logPath, m.logLines, m.logErr = "", "", nil, nil
 	}
 	return m, nil
 }
@@ -198,6 +249,9 @@ func (m model) handleSettingsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	if m.settingsOpen {
 		return m.settingsView()
+	}
+	if m.logOpen {
+		return m.logView()
 	}
 	lines := []string{m.titleBar("fleet"), ""}
 	if m.err != nil {
@@ -231,7 +285,7 @@ func (m model) View() string {
 	if m.status != "" {
 		lines = append(lines, m.statusStyle().Render(m.status))
 	}
-	lines = append(lines, "", dimStyle.Render("↑/↓ select · s start · x stop · r restart · S/X/R all · c config · q quit"))
+	lines = append(lines, "", dimStyle.Render("↑/↓ select · s start · x stop · r restart · S/X/R all · l log · c config · q quit"))
 	return strings.Join(lines, "\n") + "\n"
 }
 
@@ -248,7 +302,7 @@ func (m model) systemRow(s ipc.System, selected bool) string {
 		pid = fmt.Sprintf("%d", s.PID)
 	}
 	age := "–"
-	if s.State == ipc.StateRunning && !s.Multi { // a multi runner is one row; per-symbol bar-age isn't shown
+	if s.State == ipc.StateRunning && s.LastBarAgeS > 0 { // for a multi runner this is the STALEST leg (§15)
 		age = fmt.Sprintf("%.0fs", s.LastBarAgeS)
 	}
 	id := s.SystemID
@@ -482,6 +536,133 @@ func (m model) settingsView() string {
 	}
 	lines = append(lines, "", dimStyle.Render("↑/↓ select · ←/→ or -/+ change (auto-saved) · esc back"))
 	return strings.Join(lines, "\n") + "\n"
+}
+
+// --- log tail (Glance, §15) --------------------------------------------------
+
+const (
+	logTailMax    = 500        // most lines kept/scanned from the tail
+	logTailWindow = 256 * 1024 // bytes read from the file's end (the live view depends on the JSONL, §15)
+)
+
+// openLog resolves the inference JSONL to tail for the selected row and opens the Glance screen. A
+// single-trader has one inference dir (LogPaths.Inference); a multi-trader has one per leg, so it
+// watches the STALEST leg — usually the one a wedge is about — and labels which symbol.
+func (m *model) openLog() {
+	if m.cursor < 0 || m.cursor >= len(m.fleet.Systems) {
+		return
+	}
+	s := m.fleet.Systems[m.cursor]
+	dir, sym := s.LogPaths.Inference, ""
+	if len(s.Legs) > 0 {
+		worst := s.Legs[0]
+		for _, leg := range s.Legs[1:] {
+			switch {
+			case worst.LastBarTS.IsZero() && !leg.LastBarTS.IsZero(): // prefer a leg that has data
+				worst = leg
+			case !leg.LastBarTS.IsZero() && leg.LastBarTS.Before(worst.LastBarTS): // then the oldest
+				worst = leg
+			}
+		}
+		dir, sym = worst.Inference, worst.Symbol
+	}
+	if dir == "" {
+		m.status = "no inference log for " + s.SystemID
+		return
+	}
+	m.logDir, m.logPath = dir, "" // the dated file is resolved per read (follows the midnight rollover)
+	m.logTitle = s.SystemID
+	if sym != "" {
+		m.logTitle += " [" + sym + "]"
+	}
+	m.logLines, m.logErr, m.logOpen = nil, nil, true
+}
+
+// logViewport is how many tail lines fit below the screen chrome (title/path/footer); a sane default
+// before the first WindowSizeMsg arrives.
+func (m model) logViewport() int {
+	const chrome = 7
+	if m.height > chrome+3 {
+		return m.height - chrome
+	}
+	return 20
+}
+
+func (m model) logView() string {
+	path := m.logPath
+	if path == "" { // before the first read resolves today's file
+		path = m.logDir
+	}
+	lines := []string{m.titleBar("log · " + m.logTitle), "", dimStyle.Render(path), ""}
+	switch {
+	case m.logErr != nil:
+		lines = append(lines, alertStyle.Render("read error: "+m.logErr.Error()))
+	case len(m.logLines) == 0:
+		lines = append(lines, dimStyle.Render("(waiting for log lines — no bar written yet today)"))
+	default:
+		body := m.logLines
+		if limit := m.logViewport(); len(body) > limit {
+			body = body[len(body)-limit:]
+		}
+		for _, l := range body {
+			if m.width > 0 { // keep long JSONL records from wrapping and breaking the layout
+				l = truncate(l, m.width)
+			}
+			lines = append(lines, l)
+		}
+	}
+	lines = append(lines, "", dimStyle.Render("live tail · refreshes every 2s · esc/l back · q quit"))
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// readLogTail resolves today's inference file under dir (re-resolved every read so the tail follows
+// the UTC-midnight rollover) and tails it.
+func readLogTail(dir string) tea.Cmd {
+	return func() tea.Msg {
+		path := filepath.Join(dir, "inference_"+time.Now().UTC().Format("20060102")+".jsonl")
+		lines, err := tailFile(path, logTailMax)
+		return logTailMsg{dir: dir, path: path, lines: lines, err: err}
+	}
+}
+
+// tailFile returns up to the last `limit` non-empty lines of a file, reading only its tail window so
+// the cost stays constant as the day's JSONL grows. A missing file is not an error (the day's file
+// may not exist yet) — it yields no lines.
+func tailFile(path string, limit int) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	start := int64(0)
+	if fi.Size() > logTailWindow {
+		start = fi.Size() - logTailWindow
+	}
+	buf := make([]byte, fi.Size()-start)
+	if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+		return nil, err
+	}
+	raw := strings.Split(string(buf), "\n")
+	if start > 0 && len(raw) > 0 {
+		raw = raw[1:] // drop a partial first line from mid-window
+	}
+	lines := make([]string, 0, len(raw))
+	for _, l := range raw {
+		if strings.TrimSpace(l) != "" {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+	}
+	return lines, nil
 }
 
 // --- polling -----------------------------------------------------------------

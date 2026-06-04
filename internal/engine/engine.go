@@ -471,24 +471,46 @@ func (e *engine) persistIdentities() {
 func (e *engine) checkLiveness(systems []ipc.System, now time.Time, settings ipc.Settings) {
 	for i := range systems {
 		s := &systems[i]
-		// Only a Running system with at least one observed bar is assessable. (No bar yet -> a
-		// just-started system; not wedged. A transition overlay -> not Running; skip.)
-		if s.State != ipc.StateRunning || s.LastBarTS.IsZero() {
+		// Only a Running system is assessable. (A transition overlay -> not Running; skip.)
+		if s.State != ipc.StateRunning {
 			delete(e.wedged, s.SystemID)
 			continue
 		}
-		tf, ok := parseTimeframe(s.Timeframe)
-		if !ok {
-			continue // unknown cadence — cannot judge staleness
+		// A multi-trader is judged per leg — wedged if ANY symbol is stale past its OWN cadence, so a
+		// basket mixing M5 and H1 legs is each held to its own clock. A single-trader is its one
+		// (timeframe, last-bar) leg. The most-overdue wedged leg drives the alert. A leg with no bar
+		// yet (just started) or an unsizable cadence is not assessable and is ignored.
+		legs := s.Legs
+		if len(legs) == 0 {
+			legs = []ipc.SystemLeg{{Symbol: s.Symbol, Timeframe: s.Timeframe, LastBarTS: s.LastBarTS}}
 		}
-		threshold := time.Duration(settings.WedgeMultiple)*tf + time.Duration(settings.WedgeGraceS)*time.Second
-		age := now.Sub(s.LastBarTS)
-		s.Wedged = age > threshold
+		var judged, wedged bool
+		var wSym string
+		var wAge, wThreshold time.Duration
+		for _, leg := range legs {
+			w, age, threshold, ok := legWedged(leg.Timeframe, leg.LastBarTS, now, settings)
+			if !ok {
+				continue
+			}
+			judged = true
+			if w && (!wedged || age-threshold > wAge-wThreshold) {
+				wedged, wSym, wAge, wThreshold = true, leg.Symbol, age, threshold
+			}
+		}
+		if !judged {
+			delete(e.wedged, s.SystemID) // no bar yet, or cadence unknown — not assessable
+			continue
+		}
+		s.Wedged = wedged
 		switch {
 		case s.Wedged && !e.wedged[s.SystemID]:
 			e.wedged[s.SystemID] = true
+			who := s.SystemID
+			if s.Multi {
+				who = fmt.Sprintf("%s [%s]", s.SystemID, wSym) // name the stale leg
+			}
 			msg := fmt.Sprintf("%s: WEDGED — no new bar for %s while PID %d alive (threshold %s)",
-				s.SystemID, age.Round(time.Second), s.PID, threshold)
+				who, wAge.Round(time.Second), s.PID, wThreshold)
 			switch {
 			case settings.WedgeAlert == ipc.WedgeAlertSurface:
 				log.Printf("engine: %s (alert suppressed — surface_only)", msg)
@@ -502,6 +524,23 @@ func (e *engine) checkLiveness(systems []ipc.System, now time.Time, settings ipc
 			log.Printf("engine: %s recovered — bar fresh again", s.SystemID)
 		}
 	}
+}
+
+// legWedged reports whether one liveness clock (a bar at ts on cadence tf) is stale past the settings
+// threshold (WedgeMultiple bar-intervals + grace), returning the age and threshold for the alert
+// message. ok=false when there is no bar yet (ts zero) or the cadence can't be sized — neither is
+// judgeable, so the caller ignores the leg.
+func legWedged(tf string, ts, now time.Time, settings ipc.Settings) (wedged bool, age, threshold time.Duration, ok bool) {
+	if ts.IsZero() {
+		return false, 0, 0, false
+	}
+	d, parsed := parseTimeframe(tf)
+	if !parsed {
+		return false, 0, 0, false
+	}
+	threshold = time.Duration(settings.WedgeMultiple)*d + time.Duration(settings.WedgeGraceS)*time.Second
+	age = now.Sub(ts)
+	return age > threshold, age, threshold, true
 }
 
 // parseTimeframe turns a timeframe label into its bar interval. Accepts MT5-style labels (M5, M15,

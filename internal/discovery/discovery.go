@@ -32,8 +32,19 @@ type System struct {
 func Scan(liveBase string) ([]System, error) {
 	var out []System
 	err := filepath.WalkDir(liveBase, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || d.Name() != "run.py" {
+		if err != nil {
 			return nil //nolint:nilerr // skip unreadable entries, keep scanning
+		}
+		if d.IsDir() {
+			// Skip importer-owned subtrees (.archive/.staging) and any other dot-dir: they hold
+			// copies of run.py that are NOT live systems (importsys §16). Never skip liveBase itself.
+			if path != liveBase && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Name() != "run.py" {
+			return nil
 		}
 		dir := filepath.Dir(path)
 		if code, symbols, ok := readMultiConfig(dir); ok {

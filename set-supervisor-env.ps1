@@ -6,10 +6,12 @@
 
 # ---- EDIT THESE VALUES ----
 $vars = @{
-    "OKMICH_QUANT_LIVE_BASE"            = "C:\okmich\quant\live"
-    "OKMICH_QUANT_LOG_BASE"             = "C:\okmich\quant\logs"
-    "OKMICH_QUANT_ENV_DIR"              = "C:\okmich\quant\env"
-    "OKMICH_QUANT_SUPERVISOR_STATE_DIR" = "C:\okmich\quant\supervisor_state"
+    "OKMICH_QUANT_GLOBAL_CONFIG"        = "E:\quant\.global"
+    "OKMICH_QUANT_LIVE_BASE"            = "E:\quant\live"
+    "OKMICH_QUANT_LOG_BASE"             = "E:\quant\logs"
+    "OKMICH_QUANT_ENV_DIR"              = "E:\quant\env"
+    "OKMICH_QUANT_SUPERVISOR_STATE_DIR" = "E:\quant\supervisor_state"
+    "OKMICH_QUANT_PYTHON"               = "E:\project\quant-studies\signalfoundry\.venv\Scripts\python.exe"
 }
 # ---------------------------
 

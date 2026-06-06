@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
+	"github.com/okmich/signalfoundry-supervisor/internal/importsys"
 	"github.com/okmich/signalfoundry-supervisor/internal/ipc"
 )
 
@@ -79,9 +80,10 @@ type model struct {
 	fleet   ipc.FleetState
 	err     error
 	cursor  int                   // selected fleet row
-	confirm *confirmState         // non-nil while awaiting y/n for a bulk stop
-	pending map[string]pendingCmd // submitted command id -> what it was, to surface its result
-	status  string                // latest action / result line
+	confirm   *confirmState         // non-nil while awaiting y/n for a bulk stop
+	importing *importState          // non-nil while the import dialog is open
+	pending   map[string]pendingCmd // submitted command id -> what it was, to surface its result
+	status    string                // latest action / result line
 
 	settingsOpen bool         // settings screen is showing
 	settings     ipc.Settings // editable copy (loaded on open, written on each change)
@@ -100,6 +102,15 @@ type confirmState struct {
 type pendingCmd struct {
 	action   string
 	systemID string
+}
+
+// importState drives the system-import dialog: the operator types a source folder, Enter validates it
+// into a Plan (import mode is purely a TUI client of importsys), then a y/n confirm gates the
+// archive+install. Closing the TUI mid-flow is safe — the install is a staged atomic rename.
+type importState struct {
+	input   string          // source path being typed (editing phase)
+	plan    *importsys.Plan // non-nil once validated -> confirm phase
+	errText string          // last validation error, shown inline
 }
 
 type tickMsg time.Time
@@ -142,6 +153,9 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.confirm = nil
 		return m, nil
 	}
+	if m.importing != nil {
+		return m.handleImportKey(k)
+	}
 	switch k.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
@@ -165,8 +179,60 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.armBulkConfirm("stop")
 	case "R": // restart-all — confirm first (it is a fleet-wide stop too)
 		m.armBulkConfirm("restart")
+	case "i": // open the import-system dialog
+		m.importing = &importState{}
+		m.status = ""
 	case "c": // open the settings screen
 		m.openSettings()
+	}
+	return m, nil
+}
+
+// handleImportKey drives the import dialog. Editing phase: type/paste the source folder, Enter
+// validates it into a Plan, esc cancels. Confirm phase (plan built): y installs, any other key returns
+// to editing. The install is delegated to importsys; the engine re-discovers the new system next tick.
+func (m model) handleImportKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	im := m.importing
+	if im.plan != nil { // confirm phase
+		switch k.String() {
+		case "y", "Y":
+			archived, err := im.plan.Apply(m.cfg)
+			switch {
+			case err != nil:
+				m.status = "import failed: " + err.Error()
+			case archived != "":
+				m.status = fmt.Sprintf("imported %s (previous copy archived)", im.plan.SystemID)
+			default:
+				m.status = "imported " + im.plan.SystemID
+			}
+			m.importing = nil
+		case "ctrl+c":
+			return m, tea.Quit
+		default: // back to editing
+			im.plan = nil
+		}
+		return m, nil
+	}
+	switch k.Type { // editing phase
+	case tea.KeyEsc:
+		m.importing = nil
+		m.status = "import cancelled"
+	case tea.KeyCtrlC:
+		return m, tea.Quit
+	case tea.KeyEnter:
+		if plan, err := importsys.BuildPlan(m.cfg, im.input); err != nil {
+			im.errText = err.Error()
+		} else {
+			im.errText, im.plan = "", &plan
+		}
+	case tea.KeyBackspace:
+		if r := []rune(im.input); len(r) > 0 {
+			im.input = string(r[:len(r)-1])
+		}
+	case tea.KeySpace:
+		im.input += " "
+	case tea.KeyRunes:
+		im.input += string(k.Runes)
 	}
 	return m, nil
 }
@@ -198,6 +264,9 @@ func (m model) handleSettingsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) View() string {
 	if m.settingsOpen {
 		return m.settingsView()
+	}
+	if m.importing != nil {
+		return m.importView()
 	}
 	lines := []string{m.titleBar("fleet"), ""}
 	if m.err != nil {
@@ -231,7 +300,42 @@ func (m model) View() string {
 	if m.status != "" {
 		lines = append(lines, m.statusStyle().Render(m.status))
 	}
-	lines = append(lines, "", dimStyle.Render("↑/↓ select · s start · x stop · r restart · S/X/R all · c config · q quit"))
+	lines = append(lines, "", dimStyle.Render("↑/↓ select · s start · x stop · r restart · S/X/R all · i import · c config · q quit"))
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// importView renders the import dialog: the path editor, or — once a plan is built — the resolved
+// classification/target for a y/n confirm.
+func (m model) importView() string {
+	im := m.importing
+	lines := []string{m.titleBar("import system"), ""}
+	if im.plan == nil { // editing phase
+		lines = append(lines,
+			dimStyle.Render("  Source folder to import (must contain run.py + config.json):"),
+			"  "+selStyle.Render(im.input)+cursorStyle.Render("▌"))
+		if im.errText != "" {
+			lines = append(lines, "", alertStyle.Render("  ✗ "+im.errText))
+		}
+		lines = append(lines, "", dimStyle.Render("  enter validate · esc cancel"))
+		return strings.Join(lines, "\n") + "\n"
+	}
+	p := im.plan
+	kind, detail := "single-trader", fmt.Sprintf("%s / %s / %d", p.Strategy, p.Symbol, p.Timeframe)
+	if p.Multi {
+		kind = fmt.Sprintf("multi-trader · %d symbols", len(p.Symbols))
+		detail = strings.Join(p.Symbols, ", ")
+	}
+	lines = append(lines,
+		"  "+okStyle.Render("✓ valid ")+dimStyle.Render(kind),
+		dimStyle.Render("  system  ")+selStyle.Render(p.SystemID),
+		dimStyle.Render("  detail  ")+detail,
+		dimStyle.Render("  source  ")+p.SourceDir,
+		dimStyle.Render("  target  ")+p.TargetDir,
+	)
+	if p.WillArchive {
+		lines = append(lines, "", wedgeStyle.Render("  ⚠ target exists — the current copy is archived first"))
+	}
+	lines = append(lines, "", alertStyle.Render("  install here?  [y] confirm   [any other key] back"))
 	return strings.Join(lines, "\n") + "\n"
 }
 

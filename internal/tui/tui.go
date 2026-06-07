@@ -21,7 +21,7 @@ import (
 
 // Column widths for the fleet table (visible cells; lipgloss pads around color codes).
 const (
-	colSystem = 38
+	colSystem = 76
 	colState  = 12
 	colPID    = 8
 	colAge    = 8
@@ -94,11 +94,12 @@ type model struct {
 	settings     ipc.Settings // editable copy (loaded on open, written on each change)
 	setCursor    int          // selected settings row (0=mode, 1=multiple, 2=grace)
 
-	detailOpen bool    // the per-system details screen (Glance, §15) is showing
-	detailID   string  // SystemID being shown (re-looked-up each tick for live status)
-	detailTab  int     // active inference symbol tab (right pane)
-	sysPane    logPane // left pane: z_system_log.log (one per process)
-	infPane    logPane // right pane: the active symbol's inference JSONL
+	detailOpen  bool    // the per-system details screen (Glance, §15) is showing
+	detailID    string  // SystemID being shown (re-looked-up each tick for live status)
+	detailTab   int     // active inference symbol tab (right pane)
+	detailFocus int     // which log pane the scroll keys drive: 0 = left (z_system_log), 1 = right (inference)
+	sysPane     logPane // left pane: z_system_log.log (one per process)
+	infPane     logPane // right pane: the active symbol's inference JSONL
 
 	width  int // terminal width (from WindowSizeMsg), for right-aligning the title bar
 	height int // terminal height, to bound the log panes
@@ -112,6 +113,8 @@ type logPane struct {
 	path  string
 	lines []string
 	err   error
+	voff  int // lines scrolled UP from the live bottom (0 = following the tail)
+	hoff  int // columns scrolled RIGHT from the left edge (0 = start of line)
 }
 
 // confirmState gates a destructive action behind an explicit y/n, so an errant keystroke never fires
@@ -300,10 +303,30 @@ func (m model) handleDetailKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.armQuit()
 	case "esc", "q":
 		m.closeDetail()
-	case "tab", "right":
+	case "tab":
 		return m.cycleTab(1)
-	case "shift+tab", "left":
+	case "shift+tab":
 		return m.cycleTab(-1)
+	case "f", " ": // switch which log pane the scroll keys drive
+		m.detailFocus ^= 1
+	case "up", "k": // scroll the focused pane toward older lines
+		m.scrollFocusedV(1)
+	case "down", "j": // toward newer lines (0 = live tail)
+		m.scrollFocusedV(-1)
+	case "pgup":
+		m.scrollFocusedV(m.detailPaneHeight() - 1)
+	case "pgdown":
+		m.scrollFocusedV(-(m.detailPaneHeight() - 1))
+	case "left", "h": // scroll the focused pane left for overflowing lines
+		m.scrollFocusedH(-8)
+	case "right", "l":
+		m.scrollFocusedH(8)
+	case "g", "home": // jump to the oldest buffered line
+		fp := m.focusedPane()
+		fp.voff = max(0, len(fp.lines)-1)
+	case "G", "end": // jump back to the live tail
+		fp := m.focusedPane()
+		fp.voff, fp.hoff = 0, 0
 	case "s":
 		m.armSingleConfirm("start", m.detailID)
 	case "x":
@@ -837,7 +860,7 @@ func (m *model) openDetail() {
 	}
 	s := m.fleet.Systems[m.cursor]
 	tabs := detailTabs(s)
-	m.detailID, m.detailTab, m.detailOpen = s.SystemID, stalestTab(tabs), true
+	m.detailID, m.detailTab, m.detailOpen, m.detailFocus = s.SystemID, stalestTab(tabs), true, 1
 	m.sysPane = logPane{key: s.LogPaths.Text}
 	m.infPane = logPane{}
 	if t := m.detailTab; t < len(tabs) {

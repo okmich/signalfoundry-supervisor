@@ -220,16 +220,16 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor < len(m.fleet.Systems)-1 {
 			m.cursor++
 		}
-	case "s": // start is additive — no confirm
-		m.submitOne("start")
+	case "s": // start — confirm first (every market-moving key is gated; operator preference)
+		m.armSingleConfirm("start", m.currentSystemID())
 	case "x": // stop — confirm first
 		m.armSingleConfirm("stop", m.currentSystemID())
 	case "r": // restart — confirm first
 		m.armSingleConfirm("restart", m.currentSystemID())
 	case "K": // force-kill — confirm first (bypasses graceful shutdown); shift-K to avoid the vim-k nav + add friction
 		m.armSingleConfirm("kill", m.currentSystemID())
-	case "S": // start-all — no confirm (additive; §11.1)
-		m.submitBulk("start")
+	case "S": // start-all — confirm first
+		m.armBulkConfirm("start")
 	case "X": // stop-all — confirm first
 		m.armBulkConfirm("stop")
 	case "R": // restart-all — confirm first (it is a fleet-wide stop too)
@@ -259,7 +259,7 @@ func (m model) handleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch c.action {
 	case "quit":
 		return m, tea.Quit
-	case "stop", "restart", "kill":
+	case "start", "stop", "restart", "kill":
 		if c.bulk {
 			m.submitBulk(c.action)
 		} else {
@@ -269,8 +269,8 @@ func (m model) handleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleDetailKey drives the details screen: tab/←→ cycle the inference symbol tabs, s/x/r control
-// this system in place (x/r confirmed), esc/q back to the fleet (no confirm — non-destructive),
+// handleDetailKey drives the details screen: tab/←→ cycle the inference symbol tabs, s/x/r/K control
+// this system in place (all confirmed), esc/q back to the fleet (no confirm — non-destructive),
 // ctrl+c quits (confirmed).
 func (m model) handleDetailKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
@@ -283,7 +283,7 @@ func (m model) handleDetailKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "shift+tab", "left":
 		return m.cycleTab(-1)
 	case "s":
-		m.submitDetail("start")
+		m.armSingleConfirm("start", m.detailID)
 	case "x":
 		m.armSingleConfirm("stop", m.detailID)
 	case "r":
@@ -387,7 +387,7 @@ func (m model) confirmBar() string {
 	case c.action == "kill":
 		what = fmt.Sprintf("KILL %s (force — skips graceful shutdown)", c.systemID)
 	case c.bulk:
-		what = fmt.Sprintf("%s ALL %d running system(s)", strings.ToUpper(c.action), c.count)
+		what = fmt.Sprintf("%s ALL %d system(s)", strings.ToUpper(c.action), c.count)
 	default:
 		what = fmt.Sprintf("%s %s", strings.ToUpper(c.action), c.systemID)
 	}
@@ -515,8 +515,8 @@ func (m model) currentSystemID() string {
 	return m.fleet.Systems[m.cursor].SystemID
 }
 
-// submitOne drops a command for the selected row. The engine validates eligibility and the PID;
-// the TUI just relays the result. Used for the unconfirmed start; stop/restart go through a confirm.
+// submitOne drops a command for the selected row via submitByID. Interactive start/stop/restart now
+// all route through a confirm; this remains for direct/programmatic use.
 func (m *model) submitOne(action string) { m.submitByID(action, m.currentSystemID()) }
 
 // submitByID drops a single-system command for an explicit system id (captured at confirm-arm time,
@@ -533,7 +533,7 @@ func (m *model) submitByID(action, systemID string) {
 	}
 }
 
-// armSingleConfirm gates a single-system stop/restart behind y/n.
+// armSingleConfirm gates a single-system start/stop/restart/kill behind y/n.
 func (m *model) armSingleConfirm(action, systemID string) {
 	if systemID == "" {
 		return
@@ -566,7 +566,7 @@ func (m *model) armBulkConfirm(action string) {
 	if n := len(m.bulkTargets(action)); n > 0 {
 		m.confirm = &confirmState{action: action, bulk: true, count: n}
 	} else {
-		m.status = "nothing running for " + action + "-all"
+		m.status = "nothing eligible for " + action + "-all"
 	}
 }
 
@@ -778,15 +778,6 @@ func (m model) cycleTab(d int) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, readInferenceTail(m.infPane.key)
-}
-
-func (m *model) submitDetail(action string) {
-	if id, err := ipc.SubmitCommand(m.cfg.CommandsDir(), action, m.detailID); err == nil {
-		m.pending[id] = pendingCmd{action: action, systemID: m.detailID}
-		m.status = fmt.Sprintf("submitted %s for %s", action, m.detailID)
-	} else {
-		m.status = "submit failed: " + err.Error()
-	}
 }
 
 // detailReads are the tea.Cmds that refresh both panes (skipping a pane with no target).

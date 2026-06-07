@@ -267,6 +267,42 @@ func TestConfirmGuardsQuit(t *testing.T) {
 	}
 }
 
+// Start is gated too (operator preference overrides "start is additive"): s arms a confirm and only
+// y submits a start for the captured system.
+func TestConfirmGuardsSingleStart(t *testing.T) {
+	m := testModel(t)
+	m.cursor = 1 // b/Y/M5 (Stopped)
+
+	armed, _ := m.handleKey(key("s"))
+	mm := armed.(model)
+	if mm.confirm == nil || mm.confirm.action != "start" || mm.confirm.systemID != "b/Y/M5" || mm.confirm.bulk {
+		t.Fatalf("s should arm a single start confirm for b/Y/M5, got %+v", mm.confirm)
+	}
+	if cmds, _ := ipc.PendingCommands(mm.cfg.CommandsDir()); len(cmds) != 0 {
+		t.Fatalf("no start may be submitted before confirmation, got %d", len(cmds))
+	}
+	confirmed, _ := mm.handleKey(key("y"))
+	cmds, _ := ipc.PendingCommands(confirmed.(model).cfg.CommandsDir())
+	if len(cmds) != 1 || cmds[0].Action != "start" || cmds[0].SystemID != "b/Y/M5" {
+		t.Fatalf("confirmed start should submit one start for b/Y/M5, got %+v", cmds)
+	}
+}
+
+// Start-all is gated and, on confirm, fans out one start per eligible (Stopped) system.
+func TestConfirmGuardsStartAll(t *testing.T) {
+	m := testModel(t)
+	armed, _ := m.handleKey(key("S"))
+	mm := armed.(model)
+	if mm.confirm == nil || mm.confirm.action != "start" || !mm.confirm.bulk || mm.confirm.count != 1 {
+		t.Fatalf("S should arm a bulk start confirm (1 Stopped target), got %+v", mm.confirm)
+	}
+	confirmed, _ := mm.handleKey(key("y"))
+	cmds, _ := ipc.PendingCommands(confirmed.(model).cfg.CommandsDir())
+	if len(cmds) != 1 || cmds[0].Action != "start" || cmds[0].SystemID != "b/Y/M5" {
+		t.Fatalf("confirmed start-all should submit one start for b/Y/M5, got %+v", cmds)
+	}
+}
+
 func testModel(t *testing.T) model {
 	t.Helper()
 	return model{

@@ -66,7 +66,8 @@ type sysConfig struct {
 // descriptive error (never panics) for any non-conforming input, and refuses if the resolved system
 // is currently running — an artefact must not be swapped under a live PID.
 func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
-	src := strings.TrimSpace(sourceDir)
+	// Tolerate Windows "Copy as path" quoting (it wraps the path in ") and stray whitespace.
+	src := strings.TrimSpace(strings.Trim(strings.TrimSpace(sourceDir), `"`))
 	if src == "" {
 		return Plan{}, fmt.Errorf("no source path given")
 	}
@@ -76,6 +77,13 @@ func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
 	}
 	if info, err := os.Stat(src); err != nil || !info.IsDir() {
 		return Plan{}, fmt.Errorf("source is not a directory: %s", src)
+	}
+	// Import is FROM an external location INTO LIVE_BASE. Importing from within it would make the
+	// stage/archive churn operate on the source itself (and a source under .archive/.staging is junk).
+	if liveAbs, aerr := filepath.Abs(cfg.LiveBase); aerr == nil {
+		if rel, rerr := filepath.Rel(liveAbs, src); rerr == nil && !strings.HasPrefix(rel, "..") {
+			return Plan{}, fmt.Errorf("source %s is inside LIVE_BASE — import from an external location", src)
+		}
 	}
 	// Convention gate: both run.py and config.json must be present.
 	if _, err := os.Stat(filepath.Join(src, "run.py")); err != nil {
@@ -161,7 +169,9 @@ func (p Plan) Apply(cfg config.Config) (archivedTo string, err error) {
 		_ = os.RemoveAll(staging)
 		return "", err
 	}
-	if p.WillArchive {
+	// Re-stat rather than trusting the plan's WillArchive — the target may have appeared/vanished
+	// between BuildPlan and confirmation.
+	if _, statErr := os.Stat(p.TargetDir); statErr == nil {
 		ts := time.Now().UTC().Format("20060102T150405Z")
 		archivedTo = filepath.Join(cfg.LiveBase, ArchiveDir, relUnderLive, ts)
 		if err := os.MkdirAll(filepath.Dir(archivedTo), 0o755); err != nil {

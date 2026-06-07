@@ -29,10 +29,17 @@ delivering a `CTRL_C_EVENT` to its PID (reusing the system's existing Ctrl+C gra
 **Required (fail-fast):** `OKMICH_QUANT_LIVE_BASE`, `OKMICH_QUANT_LOG_BASE`, `OKMICH_QUANT_ENV_DIR`,
 `OKMICH_QUANT_SUPERVISOR_STATE_DIR`.
 
-**Optional:** `OKMICH_QUANT_PYTHON` (interpreter to spawn `run.py`, default `python`);
+**Optional:** `OKMICH_QUANT_PYTHON` (interpreter to spawn `run.py`, default `python`) — for a venv,
+point it at the venv's interpreter, e.g. `D:\...\.venv\Scripts\python.exe` (no activation needed; a
+venv python uses its own site-packages). The engine resolves it at startup and **warns loudly** if it
+is missing (start/restart then fail with a clear `python=...` error until it's fixed);
 `OKMICH_QUANT_GLOBAL_CONFIG` (the `.global` dir holding `notifier.env` for Telegram alerts);
 `OKMICH_QUANT_STOP_TIMEOUT` / `OKMICH_QUANT_START_TIMEOUT` (default `60s`);
 `OKMICH_QUANT_WEDGE_MULTIPLE` / `OKMICH_QUANT_WEDGE_GRACE` (wedge threshold seeds, default `3` / `1m`).
+
+The state dir may also hold `session_health.json` — an optional operator override mapping
+`broker_session_id` → `green|red|unknown` for the start gate (§13); a `red` entry refuses starts and
+shows the session DOWN in the fleet view (also a manual maintenance lockout).
 
 ## Build
 
@@ -67,10 +74,22 @@ Windows integration scripts under `_dev/`; builds on windows/linux/darwin).
   (the row wedges if any leg is stale; the fleet view shows the stalest leg's bar-age).
 - **Singleton** — a deployment-specific Windows named mutex (state-dir-hashed, OS-freed on exit, no
   stale-pidfile race); the pidfile remains for observability / the non-Windows guard.
-- **TUI** — color-coded fleet grouped by terminal, per-row + bulk control, confirm gate, a live
-  settings screen.
+- **TUI** — btop-style boxed panels: fleet grouped by terminal, per-row + bulk control, a live
+  settings screen, and a per-system **details page** (status panel + live `z_system_log` and
+  per-symbol inference tails, the inference tabbed by symbol) with start/stop/restart/kill in place.
+  Every destructive action — single/bulk **stop** and **restart**, the operator **force-kill** (`K`),
+  and **quitting** the TUI — is behind a y/n confirm, so an errant keystroke can't fire it (start is
+  additive, so it isn't gated).
+- **Force-kill (`K`)** — an operator escalation that `TerminateProcess`es a live PID immediately,
+  bypassing the graceful Ctrl+C path (use when a graceful stop won't take). Because graceful shutdown
+  never runs, the system lands in `orphan_suspected` and the broker session must be verified by hand.
+- **Broker-session start gate (§13/§14) — scaffold** — the engine refuses to start/restart a system
+  whose broker session is `red`, and the fleet view shows per-terminal session health. Resolution is
+  pluggable (`internal/session`): a per-broker `Adapter` (the real MT5/IB probe, not yet built) with a
+  file-backed operator override (`session_health.json`) as the stand-in + maintenance lockout. With no
+  adapter/override, sessions are `unknown` and the gate allows (absence of a probe never blocks).
 
 **Deferred:**
 
-- Real MT5 end-to-end validation (stand-ins prove the mechanism + engine logic).
-- Broker-session start gate (§13/§14) — MVP-deferred.
+- Real MT5/IB session **probe** adapters + the stopped-system→session mapping (the `Adapter`
+  drop-in); real MT5 end-to-end validation (stand-ins prove the mechanism + engine logic).

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"github.com/okmich/signalfoundry-supervisor/internal/notify"
 	"github.com/okmich/signalfoundry-supervisor/internal/proc"
 	"github.com/okmich/signalfoundry-supervisor/internal/registry"
+	"github.com/okmich/signalfoundry-supervisor/internal/session"
 	"github.com/okmich/signalfoundry-supervisor/internal/state"
 )
 
@@ -61,6 +63,7 @@ type engine struct {
 	notifier    *notify.Telegram       // ops alerts (orphan/wedged/crash/hard-kill); no-op without creds
 	wedged      map[string]bool        // system_id currently flagged wedged (edge-trigger the alert)
 	identities  map[string]identity    // system_id -> confirmed (pid, create-time) for PID-reuse guard
+	sessions    *session.Checker       // broker-session precondition gate (§13/§14)
 	lastPrune   time.Time              // throttles command-file housekeeping
 }
 
@@ -94,6 +97,7 @@ func Run(cfg config.Config) error {
 		wedged:      map[string]bool{},
 		identities:  map[string]identity{},
 		notifier:    notify.FromEnvFile(cfg.NotifierEnvPath()),
+		sessions:    session.NewChecker(cfg.StateDir),
 	}
 	e.loadIdentities() // re-attach baseline from the registry (validated against ground truth each tick)
 	if _, err := os.Stat(cfg.SettingsPath()); os.IsNotExist(err) {
@@ -101,8 +105,18 @@ func Run(cfg config.Config) error {
 			log.Println("engine: seed settings:", werr)
 		}
 	}
+	// Resolve the spawn interpreter up front: a venv's python.exe by path, or a bare name via PATH.
+	// Non-fatal — the engine must still re-attach/watch/stop running systems even if the interpreter
+	// is misconfigured; but pinning the absolute path now makes spawns unambiguous and turns a typo'd
+	// OKMICH_QUANT_PYTHON into a loud startup warning instead of a murky Crashed on first start.
+	if resolved, err := resolveInterpreter(e.cfg.Python); err == nil {
+		e.cfg.Python = resolved
+	} else {
+		log.Printf("engine: WARNING python interpreter %q not found (%v) — start/restart will fail until "+
+			"OKMICH_QUANT_PYTHON points at a valid interpreter (e.g. a venv's ...\\Scripts\\python.exe)", e.cfg.Python, err)
+	}
 	startedAt := time.Now().UTC()
-	log.Printf("engine %s up; live_base=%s state_dir=%s alerts=%v", Version, cfg.LiveBase, cfg.StateDir, e.notifier.Enabled())
+	log.Printf("engine %s up; live_base=%s state_dir=%s python=%s alerts=%v", Version, cfg.LiveBase, cfg.StateDir, e.cfg.Python, e.notifier.Enabled())
 
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
@@ -120,6 +134,7 @@ func Run(cfg config.Config) error {
 			e.applyTransitions(systems)             // overlay in-flight state, drive deadlines, clear on completion
 			e.checkLiveness(systems, now, settings) // flag wedged (alive but stale JSONL), alert on the edge
 			terminals := groupTerminals(systems)    // blast-radius grouping (§7); orders systems by terminal
+			e.probeSessions(terminals)              // broker-session health for each terminal (§13)
 			fs := ipc.FleetState{
 				Engine:    ipc.EngineInfo{PID: os.Getpid(), StartedAt: startedAt, Version: Version, Alerts: e.notifier.Enabled()},
 				Systems:   systems,
@@ -161,6 +176,8 @@ func (e *engine) processCommands(systems []ipc.System) {
 			res = e.doStart(c, byID[c.SystemID], cat()[c.SystemID])
 		case "restart":
 			res = e.doRestart(c, byID[c.SystemID], cat()[c.SystemID])
+		case "kill":
+			res = e.doKill(c, byID[c.SystemID])
 		default:
 			res = ipc.CommandResult{ID: c.ID, Accepted: false, Error: "unknown action: " + c.Action}
 		}
@@ -212,9 +229,13 @@ func (e *engine) doStart(c ipc.Command, s *ipc.System, d discovery.System) ipc.C
 		res.Accepted, res.Error = false, "already live or in flight: "+string(s.State)
 		return res
 	}
+	if msg, ok := e.sessionGate(s); !ok {
+		res.Accepted, res.Error = false, msg
+		return res
+	}
 	pid, err := e.launch(c.SystemID, d.RunPy)
 	if err != nil {
-		res.Accepted, res.Error = false, "spawn failed: "+err.Error()
+		res.Accepted, res.Error = false, fmt.Sprintf("spawn failed (python=%s): %v", e.cfg.Python, err)
 		return res
 	}
 	e.transitions[c.SystemID] = &transition{action: "start", phase: "starting", pid: pid, runPy: d.RunPy, deadline: time.Now().UTC().Add(e.cfg.StartTimeout)}
@@ -236,6 +257,10 @@ func (e *engine) doRestart(c ipc.Command, s *ipc.System, d discovery.System) ipc
 		res.Accepted, res.Outcome = true, "restarting"
 		return res
 	}
+	if msg, ok := e.sessionGate(s); !ok { // a restart relaunches — refuse the whole thing if the session is red
+		res.Accepted, res.Error = false, msg
+		return res
+	}
 	if s.State == ipc.StateRunning && s.PID != 0 && proc.Alive(s.PID) {
 		if err := proc.Stop(s.PID); err != nil {
 			res.Accepted, res.Error = false, "stop (for restart) failed: "+err.Error()
@@ -248,12 +273,38 @@ func (e *engine) doRestart(c ipc.Command, s *ipc.System, d discovery.System) ipc
 	}
 	pid, err := e.launch(c.SystemID, d.RunPy)
 	if err != nil {
-		res.Accepted, res.Error = false, "spawn failed: "+err.Error()
+		res.Accepted, res.Error = false, fmt.Sprintf("spawn failed (python=%s): %v", e.cfg.Python, err)
 		return res
 	}
 	e.transitions[c.SystemID] = &transition{action: "restart", phase: "starting", pid: pid, runPy: d.RunPy, deadline: time.Now().UTC().Add(e.cfg.StartTimeout)}
 	log.Printf("engine: restart (spawn, was %s) %s (pid=%d)", s.State, c.SystemID, pid)
 	res.Accepted, res.Outcome = true, "restarting"
+	return res
+}
+
+// doKill is the FORCE teardown — an operator escalation (§8): TerminateProcess the live PID now,
+// bypassing the graceful Ctrl+C path. Allowed on ANY live PID (even mid-stop, so it can break a hung
+// graceful stop); not session-gated and not graceful — the nuclear option. Because graceful_shutdown
+// never runs there is no clean-disconnect proof, so the system resolves to OrphanSuspected (via the
+// stop resolution) and the operator must verify the broker session.
+func (e *engine) doKill(c ipc.Command, s *ipc.System) ipc.CommandResult {
+	res := ipc.CommandResult{ID: c.ID}
+	if s == nil {
+		res.Accepted, res.Error = false, "unknown system: "+c.SystemID
+		return res
+	}
+	if s.PID == 0 || !proc.Alive(s.PID) {
+		res.Accepted, res.Error = false, fmt.Sprintf("not killable: no live pid (state=%s pid=%d)", s.State, s.PID)
+		return res
+	}
+	if err := proc.Kill(s.PID); err != nil {
+		res.Accepted, res.Error = false, "kill failed: "+err.Error()
+		return res
+	}
+	// Reuse the stop resolution: next tick the killed PID is gone without clean proof -> OrphanSuspected.
+	e.transitions[c.SystemID] = &transition{action: "kill", pid: s.PID, token: s.StartToken, deadline: time.Now().UTC().Add(e.cfg.StopTimeout)}
+	log.Printf("engine: KILL (TerminateProcess) for %s (pid=%d) — bypasses graceful shutdown; expect orphan_suspected", c.SystemID, s.PID)
+	res.Accepted, res.Outcome = true, "killing"
 	return res
 }
 
@@ -270,7 +321,7 @@ func (e *engine) applyTransitions(systems []ipc.System) {
 			continue
 		}
 		switch tr.action {
-		case "stop":
+		case "stop", "kill": // a force-kill resolves like a stop whose PID vanished -> OrphanSuspected
 			e.resolveStop(id, s, tr, now)
 		case "start":
 			e.resolveStart(id, s, tr, now, ipc.StateStarting)
@@ -487,14 +538,15 @@ func (e *engine) checkLiveness(systems []ipc.System, now time.Time, settings ipc
 		var judged, wedged bool
 		var wSym string
 		var wAge, wThreshold time.Duration
-		for _, leg := range legs {
-			w, age, threshold, ok := legWedged(leg.Timeframe, leg.LastBarTS, now, settings)
+		for i := range legs {
+			w, age, threshold, ok := legWedged(legs[i].Timeframe, legs[i].LastBarTS, now, settings)
 			if !ok {
 				continue
 			}
+			legs[i].Wedged = w // tag the real leg (for the details view's per-symbol ⚠); no-op on the synthetic single leg
 			judged = true
 			if w && (!wedged || age-threshold > wAge-wThreshold) {
-				wedged, wSym, wAge, wThreshold = true, leg.Symbol, age, threshold
+				wedged, wSym, wAge, wThreshold = true, legs[i].Symbol, age, threshold
 			}
 		}
 		if !judged {
@@ -590,6 +642,13 @@ func isFXWeekend(t time.Time) bool {
 	}
 }
 
+// resolveInterpreter resolves the configured python to a concrete executable: a PATH lookup for a
+// bare name ("python"), or an existence+executable check for a direct path (a venv's python.exe).
+// Done once at startup so a misconfiguration surfaces immediately and spawns use the exact interpreter.
+func resolveInterpreter(python string) (string, error) {
+	return exec.LookPath(python)
+}
+
 // launch spawns python run.py (own console). The returned PID is the spawned process; the
 // authoritative control identity (real interpreter PID + create-time + start-token) is recorded by
 // reconcileIdentities once the system reaches Running via status.json — not at spawn time, since the
@@ -647,7 +706,7 @@ func groupTerminals(systems []ipc.System) []ipc.Terminal {
 		}
 		t := byID[s.SessionID]
 		if t == nil {
-			t = &ipc.Terminal{BrokerSessionID: s.SessionID, Account: s.Account}
+			t = &ipc.Terminal{BrokerSessionID: s.SessionID, Broker: s.Broker, Account: s.Account}
 			byID[s.SessionID] = t
 			order = append(order, s.SessionID)
 		}
@@ -671,4 +730,27 @@ func groupKey(s ipc.System) string {
 		return "\xff"
 	}
 	return s.SessionID
+}
+
+// probeSessions stamps each terminal with its broker-session health (§13) for the fleet view.
+func (e *engine) probeSessions(terminals []ipc.Terminal) {
+	for i := range terminals {
+		st := e.sessions.Probe(session.Ref{
+			Broker: terminals[i].Broker, Account: terminals[i].Account, SessionID: terminals[i].BrokerSessionID,
+		})
+		terminals[i].Health = string(st.Health)
+	}
+}
+
+// sessionGate is the start precondition (§13): refuse a start/restart when the system's broker
+// session is a definite red. A stopped system has no live session id, so it resolves to Unknown and
+// is allowed — the cold-start → session mapping is a per-broker adapter's job (§14), not the generic
+// core's; this gate fires on sessions the supervisor can see (running terminals, restarts, or an
+// operator override). Returns the operator-facing reason and false when the start must be refused.
+func (e *engine) sessionGate(s *ipc.System) (string, bool) {
+	ok, st := e.sessions.Allowed(session.Ref{Broker: s.Broker, Account: s.Account, SessionID: s.SessionID})
+	if ok {
+		return "", true
+	}
+	return fmt.Sprintf("broker session %s is red — refusing start (%s)", s.SessionID, st.Detail), false
 }

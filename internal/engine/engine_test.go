@@ -2,14 +2,18 @@ package engine
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
+	"github.com/okmich/signalfoundry-supervisor/internal/discovery"
 	"github.com/okmich/signalfoundry-supervisor/internal/ipc"
 	"github.com/okmich/signalfoundry-supervisor/internal/notify"
 	"github.com/okmich/signalfoundry-supervisor/internal/proc"
 	"github.com/okmich/signalfoundry-supervisor/internal/registry"
+	"github.com/okmich/signalfoundry-supervisor/internal/session"
 )
 
 func TestParseTimeframe(t *testing.T) {
@@ -59,12 +63,67 @@ func TestIsFXWeekend(t *testing.T) {
 }
 
 func testEngine(t *testing.T) *engine {
+	dir := t.TempDir()
 	return &engine{
-		cfg:         config.Config{WedgeMultiple: 3, WedgeGrace: time.Minute, StateDir: t.TempDir()}, // M5 threshold = 16m
+		cfg:         config.Config{WedgeMultiple: 3, WedgeGrace: time.Minute, StateDir: dir}, // M5 threshold = 16m
 		transitions: map[string]*transition{},
 		wedged:      map[string]bool{},
 		identities:  map[string]identity{},
 		notifier:    notify.FromEnvFile(""), // no creds -> alert is a no-op
+		sessions:    session.NewChecker(dir),
+	}
+}
+
+// The start gate (§13) refuses a start when the system's broker session is red, and allows it when
+// the session is unknown/unprobed (absence of a probe never blocks).
+func TestDoStartGatedOnSessionHealth(t *testing.T) {
+	e := testEngine(t)
+	s := &ipc.System{SystemID: "x/Y/M5", State: ipc.StateStopped, Broker: "deriv", Account: "DEMO-1", SessionID: "mt5-deriv-1"}
+
+	// Unknown/unprobed session: the gate allows (no probe should never block).
+	if msg, ok := e.sessionGate(s); !ok {
+		t.Errorf("unknown session should pass the gate, got refusal %q", msg)
+	}
+
+	// Mark the session red via the override file -> the gate refuses, and doStart rejects without spawning.
+	if err := os.WriteFile(filepath.Join(e.cfg.StateDir, "session_health.json"), []byte(`{"mt5-deriv-1":"red"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.sessionGate(s); ok {
+		t.Errorf("red session should fail the gate")
+	}
+	res := e.doStart(ipc.Command{ID: "c1", SystemID: "x/Y/M5"}, s, discovery.System{RunPy: "run.py"})
+	if res.Accepted || !strings.Contains(res.Error, "broker session") {
+		t.Errorf("red session should refuse the start, got accepted=%v err=%q", res.Accepted, res.Error)
+	}
+	if e.transitions["x/Y/M5"] != nil {
+		t.Errorf("a gated start must not register an in-flight transition (no spawn)")
+	}
+}
+
+// doKill refuses when there is no live PID to terminate (an already-dead/never-started system),
+// without calling proc.Kill. (The successful force-kill of a live PID is exercised by the _dev
+// integration scripts, not a unit test — it would terminate a real process.)
+func TestDoKillRequiresLivePID(t *testing.T) {
+	e := testEngine(t)
+	if res := e.doKill(ipc.Command{ID: "c1", SystemID: "x"}, nil); res.Accepted || !strings.Contains(res.Error, "unknown system") {
+		t.Errorf("nil system should be unknown, got %+v", res)
+	}
+	s := &ipc.System{SystemID: "x/Y/M5", State: ipc.StateStopped} // PID 0 -> no live pid
+	res := e.doKill(ipc.Command{ID: "c2", SystemID: "x/Y/M5"}, s)
+	if res.Accepted || !strings.Contains(res.Error, "not killable") {
+		t.Errorf("a system with no live pid should not be killable, got %+v", res)
+	}
+	if e.transitions["x/Y/M5"] != nil {
+		t.Errorf("a refused kill must not register a transition")
+	}
+}
+
+// A misconfigured interpreter resolves to an error at startup (turned into a loud warning), rather
+// than silently deferring the failure to the first start.
+func TestResolveInterpreterMissing(t *testing.T) {
+	if _, err := resolveInterpreter("okmich-not-a-real-interpreter-zzz"); err == nil {
+		t.Errorf("a non-existent interpreter should not resolve")
 	}
 }
 

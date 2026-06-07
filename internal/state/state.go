@@ -38,7 +38,12 @@ func Reconcile(cfg config.Config) []ipc.System {
 			Multi:     c.Multi,
 			Symbols:   c.Symbols,
 			State:     ipc.StateStopped,
-			LogPaths:  ipc.LogPaths{Status: statusPath, Text: filepath.Join(c.Dir, "z_system_log.log")},
+			// TODO(unverified): the framework defines no standard text-log file — `setup_logging` is
+			// never called and `z_system_log.log` does not exist in it. Only the inference JSONL is
+			// contract-backed. This Text path is provisional (the details left pane degrades to "(no
+			// log yet)" when absent); confirm the real layout against live run artifacts before relying
+			// on it — it may instead be the §15 raw-stdout ops capture.
+			LogPaths: ipc.LogPaths{Status: statusPath, Text: filepath.Join(c.Dir, "z_system_log.log")},
 		}
 		if !c.Multi {
 			s.LogPaths.Inference = contract.InferenceDir(cfg.LogBase, c.RunnerStrategy, c.Symbol, c.Timeframe)
@@ -48,6 +53,7 @@ func Reconcile(cfg config.Config) []ipc.System {
 		if rs, err := contract.ReadStatus(statusPath); err == nil && (c.Multi || runnerCovers(rs, c.Symbol)) {
 			s.PID, s.StartToken = rs.PID, rs.RunnerStartToken
 			s.Broker, s.Account, s.SessionID = rs.Broker, rs.AccountID, rs.BrokerSessionID
+			s.StartedAt = rs.StartedAt
 			switch {
 			case rs.State == "running" && proc.Alive(rs.PID):
 				s.State = ipc.StateRunning

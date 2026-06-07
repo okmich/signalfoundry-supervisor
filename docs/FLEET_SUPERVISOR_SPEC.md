@@ -3,8 +3,9 @@
 > Status: design spec — interface-precise. Settled 2026-06-01; control mechanism revised
 > 2026-06-02 (targeted Ctrl+C via AttachConsole, §9); bulk operations specified 2026-06-03 (§11.1).
 > **Largely implemented** in this repo (`signalfoundry-supervisor`): MVP + re-attach (§12),
-> multi-trader with runner-level liveness (§15/§16), blast-radius (§7), and a named-mutex
-> singleton; see `../README.md` for the implementation status.
+> multi-trader with runner-level liveness (§15/§16), blast-radius (§7), a named-mutex singleton, and
+> the broker-session start-gate scaffold (§13/§14 — gate + override + UI; real MT5/IB probe pending);
+> see `../README.md` for the implementation status.
 > Companion contracts (`LOGGING_CONTRACT.md`,
 > `OPS_REFERENCE_GUIDE.md`) live in the sibling `signalfoundry-lab` repo.
 > Scope: the per-box **Supervisor** (a process control plane for live trading

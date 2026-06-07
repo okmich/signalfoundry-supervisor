@@ -38,9 +38,11 @@ type EngineInfo struct {
 // Terminal groups the logical systems that share one broker session/account (die together, §7).
 type Terminal struct {
 	BrokerSessionID string   `json:"broker_session_id"`
+	Broker          string   `json:"broker,omitempty"`
 	Account         string   `json:"account_id"`
 	SystemIDs       []string `json:"system_ids"`
-	LogicalSystems  int      `json:"logical_systems"` // the ≤10/terminal cap unit (a multi-trader counts as len(symbols))
+	LogicalSystems  int      `json:"logical_systems"`  // the ≤10/terminal cap unit (a multi-trader counts as len(symbols))
+	Health          string   `json:"health,omitempty"` // broker-session precondition health (green|red|unknown, §13)
 }
 
 // SystemLeg is one logical system's liveness clock inside a multi-trader runner (§16). A single-
@@ -52,6 +54,7 @@ type SystemLeg struct {
 	Timeframe string    `json:"timeframe"`
 	Inference string    `json:"inference,omitempty"` // this symbol's inference dir (the TUI Glance tail, §15)
 	LastBarTS time.Time `json:"last_bar_ts"`
+	Wedged    bool      `json:"wedged,omitempty"` // this leg is stale past its own cadence (engine-tagged, §15)
 }
 
 // LogPaths let the TUI tail raw logs directly (the engine does not proxy log bytes).
@@ -75,6 +78,7 @@ type System struct {
 	Broker      string      `json:"broker,omitempty"`
 	Account     string      `json:"account_id,omitempty"`
 	SessionID   string      `json:"broker_session_id,omitempty"`
+	StartedAt   time.Time   `json:"started_at"` // runner start time (status.json), for the details view
 	LastBarTS   time.Time   `json:"last_bar_ts"`
 	LastBarAgeS float64     `json:"last_bar_age_s"`   // liveness: seconds since last bar
 	Wedged      bool        `json:"wedged,omitempty"` // alive but JSONL stale past threshold (§15); orthogonal to State

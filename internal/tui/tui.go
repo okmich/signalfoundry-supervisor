@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -90,22 +91,33 @@ type model struct {
 	settings     ipc.Settings // editable copy (loaded on open, written on each change)
 	setCursor    int          // selected settings row (0=mode, 1=multiple, 2=grace)
 
-	logOpen  bool     // the live log-tail (Glance, §15) screen is showing
-	logDir   string   // inference dir being watched (the identity; today's file is resolved per read)
-	logPath  string   // dated JSONL file last read (display only), set from logTailMsg
-	logTitle string   // header label for the tail screen
-	logLines []string // latest tail of logPath
-	logErr   error    // last tail-read error, if any
+	detailOpen bool    // the per-system details screen (Glance, §15) is showing
+	detailID   string  // SystemID being shown (re-looked-up each tick for live status)
+	detailTab  int     // active inference symbol tab (right pane)
+	sysPane    logPane // left pane: z_system_log.log (one per process)
+	infPane    logPane // right pane: the active symbol's inference JSONL
 
 	width  int // terminal width (from WindowSizeMsg), for right-aligning the title bar
-	height int // terminal height, to bound the log-tail viewport
+	height int // terminal height, to bound the log panes
 }
 
-// confirmState gates a fleet-wide stop behind an explicit y/n (§11.1: a fleet stop is only an
-// explicit operator command, never a single keystroke).
+// logPane is one tailed file in the details view. key is the read's identity (the file path for the
+// text log, the inference dir for the JSONL) so a stale async read for a pane we've since retargeted
+// is discarded; path is the dated file last read (display); lines/err is the latest tail.
+type logPane struct {
+	key   string
+	path  string
+	lines []string
+	err   error
+}
+
+// confirmState gates a destructive action behind an explicit y/n, so an errant keystroke never fires
+// it: a single stop/restart, a fleet-wide stop/restart (§11.1), or quitting the TUI.
 type confirmState struct {
-	action string // "stop" | "restart"
-	count  int
+	action   string // "stop" | "restart" | "quit"
+	bulk     bool   // whole-box fan-out vs a single system
+	systemID string // single target (empty for bulk / quit)
+	count    int    // bulk target count (for the prompt)
 }
 
 type pendingCmd struct {
@@ -116,11 +128,18 @@ type pendingCmd struct {
 type tickMsg time.Time
 type errMsg struct{ err error }
 
-// logTailMsg carries a fresh tail of the file being watched in the Glance screen (§15). dir is the
-// read's identity (so a late-arriving read for a dir we've stopped watching is discarded); path is
-// the dated file actually read, resolved per read so the tail follows the UTC-midnight rollover.
+// pane discriminates the two log panes of the details view.
+const (
+	paneSys = iota // left: z_system_log.log
+	paneInf        // right: active symbol's inference JSONL
+)
+
+// logTailMsg carries a fresh tail for one details pane. pane says which; key is the read's identity
+// (matched against the pane's current target so a stale async read is discarded); path is the file
+// actually read (display, resolved per read so it follows the UTC-midnight rollover).
 type logTailMsg struct {
-	dir   string
+	pane  int
+	key   string
 	path  string
 	lines []string
 	err   error
@@ -143,15 +162,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 		return m, nil
 	case logTailMsg:
-		if m.logOpen && msg.dir == m.logDir { // ignore a read for a dir we've since stopped watching
-			m.logPath, m.logLines, m.logErr = msg.path, msg.lines, msg.err
+		if m.detailOpen { // apply only if the pane still targets what this read was for
+			switch msg.pane {
+			case paneSys:
+				if msg.key == m.sysPane.key {
+					m.sysPane.path, m.sysPane.lines, m.sysPane.err = msg.path, msg.lines, msg.err
+				}
+			case paneInf:
+				if msg.key == m.infPane.key {
+					m.infPane.path, m.infPane.lines, m.infPane.err = msg.path, msg.lines, msg.err
+				}
+			}
 		}
 		return m, nil
 	case tickMsg:
 		m.resolvePending()
 		cmds := []tea.Cmd{poll(m.cfg), tick()}
-		if m.logOpen && m.logDir != "" { // keep the Glance tail live alongside the fleet poll
-			cmds = append(cmds, readLogTail(m.logDir))
+		if m.detailOpen { // keep both detail panes live alongside the fleet poll
+			cmds = append(cmds, m.detailReads()...)
 		}
 		return m, tea.Batch(cmds...)
 	}
@@ -159,25 +187,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// A pending confirmation intercepts ALL keys on every screen: only y proceeds, any other key
+	// cancels — so an errant keystroke can never fire a stop/restart or quit the TUI.
+	if m.confirm != nil {
+		return m.handleConfirmKey(k)
+	}
 	if m.settingsOpen {
 		return m.handleSettingsKey(k)
 	}
-	if m.logOpen {
-		return m.handleLogKey(k)
-	}
-	// While a bulk stop is pending confirmation, only y/Y proceeds; anything else cancels.
-	if m.confirm != nil {
-		if s := k.String(); s == "y" || s == "Y" {
-			m.submitBulk(m.confirm.action)
-		} else {
-			m.status = "cancelled"
-		}
-		m.confirm = nil
-		return m, nil
+	if m.detailOpen {
+		return m.handleDetailKey(k)
 	}
 	switch k.String() {
-	case "q", "ctrl+c":
-		return m, tea.Quit
+	case "q", "ctrl+c": // quitting is confirmed too (§ erroneous-keypress guard)
+		m.armQuit()
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
@@ -186,12 +209,14 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor < len(m.fleet.Systems)-1 {
 			m.cursor++
 		}
-	case "s":
+	case "s": // start is additive — no confirm
 		m.submitOne("start")
-	case "x":
-		m.submitOne("stop")
-	case "r":
-		m.submitOne("restart")
+	case "x": // stop — confirm first
+		m.armSingleConfirm("stop", m.currentSystemID())
+	case "r": // restart — confirm first
+		m.armSingleConfirm("restart", m.currentSystemID())
+	case "K": // force-kill — confirm first (bypasses graceful shutdown); shift-K to avoid the vim-k nav + add friction
+		m.armSingleConfirm("kill", m.currentSystemID())
 	case "S": // start-all — no confirm (additive; §11.1)
 		m.submitBulk("start")
 	case "X": // stop-all — confirm first
@@ -200,24 +225,57 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.armBulkConfirm("restart")
 	case "c": // open the settings screen
 		m.openSettings()
-	case "l", "enter": // open the live log-tail (Glance, §15) for the selected row
-		m.openLog()
-		if m.logOpen {
-			return m, readLogTail(m.logDir)
+	case "l", "enter": // open the per-system details screen (Glance, §15) for the selected row
+		m.openDetail()
+		if m.detailOpen {
+			return m, tea.Batch(m.detailReads()...)
 		}
 	}
 	return m, nil
 }
 
-// handleLogKey drives the live log-tail screen: esc/l/enter/q return to the fleet view (the tail
-// keeps refreshing only while it is open), ctrl+c quits.
-func (m model) handleLogKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+// handleConfirmKey resolves a pending confirmation: only y/Y proceeds, anything else cancels.
+func (m model) handleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	c := m.confirm
+	m.confirm = nil
+	if s := k.String(); s != "y" && s != "Y" {
+		m.status = "cancelled"
+		return m, nil
+	}
+	switch c.action {
+	case "quit":
+		return m, tea.Quit
+	case "stop", "restart", "kill":
+		if c.bulk {
+			m.submitBulk(c.action)
+		} else {
+			m.submitByID(c.action, c.systemID)
+		}
+	}
+	return m, nil
+}
+
+// handleDetailKey drives the details screen: tab/←→ cycle the inference symbol tabs, s/x/r control
+// this system in place (x/r confirmed), esc/q back to the fleet (no confirm — non-destructive),
+// ctrl+c quits (confirmed).
+func (m model) handleDetailKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "ctrl+c":
-		return m, tea.Quit
-	case "esc", "l", "enter", "q":
-		m.logOpen = false
-		m.logDir, m.logPath, m.logLines, m.logErr = "", "", nil, nil
+		m.armQuit()
+	case "esc", "q":
+		m.closeDetail()
+	case "tab", "right":
+		return m.cycleTab(1)
+	case "shift+tab", "left":
+		return m.cycleTab(-1)
+	case "s":
+		m.submitDetail("start")
+	case "x":
+		m.armSingleConfirm("stop", m.detailID)
+	case "r":
+		m.armSingleConfirm("restart", m.detailID)
+	case "K": // force-kill (shift-K, consistent with the fleet view)
+		m.armSingleConfirm("kill", m.detailID)
 	}
 	return m, nil
 }
@@ -227,7 +285,7 @@ func (m model) handleLogKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) handleSettingsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() {
 	case "ctrl+c":
-		return m, tea.Quit
+		m.armQuit()
 	case "esc", "c", "q":
 		m.settingsOpen = false
 	case "up", "k":
@@ -247,23 +305,29 @@ func (m model) handleSettingsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	if m.settingsOpen {
+	switch {
+	case m.settingsOpen:
 		return m.settingsView()
+	case m.detailOpen:
+		return m.detailView()
+	default:
+		return m.fleetView()
 	}
-	if m.logOpen {
-		return m.logView()
-	}
-	lines := []string{m.titleBar("fleet"), ""}
+}
+
+// fleetView is the main screen: the fleet table inside a titled panel, with a bottom key-hint bar.
+func (m model) fleetView() string {
+	var body []string
 	if m.err != nil {
-		lines = append(lines, alertStyle.Render("engine offline? ")+dimStyle.Render(m.err.Error()), "")
+		body = append(body, alertStyle.Render("engine offline? ")+dimStyle.Render(m.err.Error()), "")
 	}
-	lines = append(lines, "  "+
+	body = append(body, "  "+
 		headerStyle.Width(colSystem).Render("SYSTEM")+
 		headerStyle.Width(colState).Render("STATE")+
 		headerStyle.Width(colPID).Render("PID")+
 		headerStyle.Width(colAge).Render("BAR AGE"))
 	if len(m.fleet.Systems) == 0 {
-		lines = append(lines, dimStyle.Render("  (no systems)"))
+		body = append(body, dimStyle.Render("  (no systems)"))
 	}
 	terms := make(map[string]ipc.Terminal, len(m.fleet.Terminals))
 	for _, t := range m.fleet.Terminals {
@@ -273,20 +337,47 @@ func (m model) View() string {
 	for i, s := range m.fleet.Systems {
 		if s.SessionID != prevSession { // start of a terminal group -> subheader
 			prevSession = s.SessionID
-			lines = append(lines, m.terminalHeader(s.SessionID, terms))
+			body = append(body, m.terminalHeader(s.SessionID, terms))
 		}
-		lines = append(lines, m.systemRow(s, i == m.cursor))
+		body = append(body, m.systemRow(s, i == m.cursor))
 	}
-	lines = append(lines, "")
-	if m.confirm != nil {
-		lines = append(lines, alertStyle.Render(fmt.Sprintf("%s ALL %d running system(s)?  [y] confirm   [any other key] cancel",
-			strings.ToUpper(m.confirm.action), m.confirm.count)))
+
+	right := dimStyle.Render(plural(len(m.fleet.Systems), "system") + " · " + plural(len(m.fleet.Terminals), "terminal"))
+	box := titledBox(boxTitleStyle.Render("fleet"), right, m.cols()-2, len(body), body)
+
+	lines := []string{m.titleBar("fleet"), "", box, ""}
+	if c := m.confirmBar(); c != "" {
+		lines = append(lines, c)
 	}
 	if m.status != "" {
 		lines = append(lines, m.statusStyle().Render(m.status))
 	}
-	lines = append(lines, "", dimStyle.Render("↑/↓ select · s start · x stop · r restart · S/X/R all · l log · c config · q quit"))
+	lines = append(lines, "", hintBar(
+		hint{"↑↓", "select"}, hint{"s", "start"}, hint{"x", "stop"}, hint{"r", "restart"}, hint{"K", "kill"},
+		hint{"S/X/R", "all"}, hint{"l", "details"}, hint{"c", "config"}, hint{"q", "quit"},
+	))
 	return strings.Join(lines, "\n") + "\n"
+}
+
+// confirmBar renders the pending-confirmation prompt (empty when none). Shown on every screen so a
+// confirm armed anywhere is visible and answered in place.
+func (m model) confirmBar() string {
+	if m.confirm == nil {
+		return ""
+	}
+	c := m.confirm
+	var what string
+	switch {
+	case c.action == "quit":
+		what = "Quit the supervisor"
+	case c.action == "kill":
+		what = fmt.Sprintf("KILL %s (force — skips graceful shutdown)", c.systemID)
+	case c.bulk:
+		what = fmt.Sprintf("%s ALL %d running system(s)", strings.ToUpper(c.action), c.count)
+	default:
+		what = fmt.Sprintf("%s %s", strings.ToUpper(c.action), c.systemID)
+	}
+	return alertStyle.Render(what+"?") + dimStyle.Render("   [y] confirm   ·   any other key cancels")
 }
 
 // systemRow renders one fleet line: cursor + system id + colored state badge + pid + bar age + wedged.
@@ -336,7 +427,24 @@ func (m model) terminalHeader(session string, terms map[string]ipc.Terminal) str
 		capStr += "  OVER CAP"
 		capStyle = alertStyle
 	}
-	return headerStyle.Render(fmt.Sprintf("terminal %s · %s · ", session, acct)) + capStyle.Render(capStr)
+	hdr := headerStyle.Render(fmt.Sprintf("terminal %s · %s · ", session, acct)) + capStyle.Render(capStr)
+	if b := healthBadge(t.Health); b != "" { // broker-session precondition (§13)
+		hdr += dimStyle.Render(" · ") + b
+	}
+	return hdr
+}
+
+// healthBadge renders a broker-session health badge; unknown/unprobed (the default until an adapter
+// or operator override exists) shows nothing, to keep the common case uncluttered.
+func healthBadge(health string) string {
+	switch health {
+	case "green":
+		return okStyle.Render("session ✓")
+	case "red":
+		return alertStyle.Render("session ✗ DOWN")
+	default:
+		return ""
+	}
 }
 
 // titleBar renders "signalfoundry supervisor — <view>" with engine pid/clock/alert state, right-aligned
@@ -385,20 +493,42 @@ func truncate(s string, w int) string {
 
 // --- actions -----------------------------------------------------------------
 
-// submitOne drops a command for the selected row. The engine validates eligibility and the PID;
-// the TUI just relays the result. Per-system stop is a single keystroke (no confirm, §11.1).
-func (m *model) submitOne(action string) {
+// currentSystemID is the selected fleet row's id ("" if the fleet is empty).
+func (m model) currentSystemID() string {
 	if m.cursor < 0 || m.cursor >= len(m.fleet.Systems) {
+		return ""
+	}
+	return m.fleet.Systems[m.cursor].SystemID
+}
+
+// submitOne drops a command for the selected row. The engine validates eligibility and the PID;
+// the TUI just relays the result. Used for the unconfirmed start; stop/restart go through a confirm.
+func (m *model) submitOne(action string) { m.submitByID(action, m.currentSystemID()) }
+
+// submitByID drops a single-system command for an explicit system id (captured at confirm-arm time,
+// so a confirmed stop/restart targets exactly what was shown in the prompt).
+func (m *model) submitByID(action, systemID string) {
+	if systemID == "" {
 		return
 	}
-	sysID := m.fleet.Systems[m.cursor].SystemID
-	if id, err := ipc.SubmitCommand(m.cfg.CommandsDir(), action, sysID); err == nil {
-		m.pending[id] = pendingCmd{action: action, systemID: sysID}
-		m.status = fmt.Sprintf("submitted %s for %s", action, sysID)
+	if id, err := ipc.SubmitCommand(m.cfg.CommandsDir(), action, systemID); err == nil {
+		m.pending[id] = pendingCmd{action: action, systemID: systemID}
+		m.status = fmt.Sprintf("submitted %s for %s", action, systemID)
 	} else {
 		m.status = "submit failed: " + err.Error()
 	}
 }
+
+// armSingleConfirm gates a single-system stop/restart behind y/n.
+func (m *model) armSingleConfirm(action, systemID string) {
+	if systemID == "" {
+		return
+	}
+	m.confirm = &confirmState{action: action, systemID: systemID}
+}
+
+// armQuit gates closing the TUI behind y/n (an errant q / ctrl+c must not exit).
+func (m *model) armQuit() { m.confirm = &confirmState{action: "quit"} }
 
 // submitBulk fans out one single-system command per eligible target (§11.1: bulk is a fan-out, not
 // a new command shape). Eligibility: start-all -> Stopped; stop-all / restart-all -> Running.
@@ -420,7 +550,7 @@ func (m *model) submitBulk(action string) {
 
 func (m *model) armBulkConfirm(action string) {
 	if n := len(m.bulkTargets(action)); n > 0 {
-		m.confirm = &confirmState{action: action, count: n}
+		m.confirm = &confirmState{action: action, bulk: true, count: n}
 	} else {
 		m.status = "nothing running for " + action + "-all"
 	}
@@ -519,109 +649,340 @@ func (m model) settingsView() string {
 		{"wedge multiple", fmt.Sprintf("%d bars", m.settings.WedgeMultiple), "missed bar intervals before wedged"},
 		{"wedge grace", fmt.Sprintf("%ds", m.settings.WedgeGraceS), "slack added to N×timeframe"},
 	}
-	lines := []string{m.titleBar("settings"), ""}
+	var body []string
 	for i, r := range rows {
 		cursor, labelStyle := "  ", dimStyle
 		if i == m.setCursor {
 			cursor, labelStyle = cursorStyle.Render("▸ "), selStyle
 		}
-		lines = append(lines, cursor+
+		body = append(body, cursor+
 			labelStyle.Width(18).Render(r.label)+
 			okStyle.Width(16).Render(r.val)+
 			dimStyle.Render(r.hint))
 	}
-	lines = append(lines, "")
+	box := titledBox(boxTitleStyle.Render("settings"), dimStyle.Render("wedge alerting · live"), m.cols()-2, len(body), body)
+
+	lines := []string{m.titleBar("settings"), "", box, ""}
+	if c := m.confirmBar(); c != "" {
+		lines = append(lines, c)
+	}
 	if m.status != "" {
 		lines = append(lines, m.statusStyle().Render(m.status))
 	}
-	lines = append(lines, "", dimStyle.Render("↑/↓ select · ←/→ or -/+ change (auto-saved) · esc back"))
+	lines = append(lines, "", hintBar(
+		hint{"↑↓", "select"}, hint{"←→ / -+", "change (auto-saved)"}, hint{"esc", "back"}, hint{"q", "quit"},
+	))
 	return strings.Join(lines, "\n") + "\n"
 }
 
-// --- log tail (Glance, §15) --------------------------------------------------
+// --- system details (Glance, §15) --------------------------------------------
 
 const (
 	logTailMax    = 500        // most lines kept/scanned from the tail
 	logTailWindow = 256 * 1024 // bytes read from the file's end (the live view depends on the JSONL, §15)
 )
 
-// openLog resolves the inference JSONL to tail for the selected row and opens the Glance screen. A
-// single-trader has one inference dir (LogPaths.Inference); a multi-trader has one per leg, so it
-// watches the STALEST leg — usually the one a wedge is about — and labels which symbol.
-func (m *model) openLog() {
+// infTab is one inference symbol tab in the details view (one per logical system).
+type infTab struct {
+	symbol    string
+	inference string // the symbol's inference dir
+	wedged    bool
+	lastBar   time.Time
+}
+
+// detailTabs lists the inference tabs for a system: one per leg for a multi-trader, or the single
+// symbol for a single-trader.
+func detailTabs(s ipc.System) []infTab {
+	if len(s.Legs) > 0 {
+		tabs := make([]infTab, len(s.Legs))
+		for i, l := range s.Legs {
+			tabs[i] = infTab{symbol: l.Symbol, inference: l.Inference, wedged: l.Wedged, lastBar: l.LastBarTS}
+		}
+		return tabs
+	}
+	return []infTab{{symbol: s.Symbol, inference: s.LogPaths.Inference, wedged: s.Wedged, lastBar: s.LastBarTS}}
+}
+
+// detailSystem re-finds the system being shown by id (the published fleet is rebuilt each tick, so
+// we look it up fresh rather than snapshotting it — the details view stays live).
+func (m model) detailSystem() (ipc.System, bool) {
+	for _, s := range m.fleet.Systems {
+		if s.SystemID == m.detailID {
+			return s, true
+		}
+	}
+	return ipc.System{}, false
+}
+
+// sessionHealth finds the published broker-session health for a session id ("" if not grouped).
+func (m model) sessionHealth(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	for _, t := range m.fleet.Terminals {
+		if t.BrokerSessionID == sessionID {
+			return t.Health
+		}
+	}
+	return ""
+}
+
+// openDetail opens the details screen for the selected row, defaulting the inference tab to the
+// stalest leg (most likely the one worth inspecting).
+func (m *model) openDetail() {
 	if m.cursor < 0 || m.cursor >= len(m.fleet.Systems) {
 		return
 	}
 	s := m.fleet.Systems[m.cursor]
-	dir, sym := s.LogPaths.Inference, ""
-	if len(s.Legs) > 0 {
-		worst := s.Legs[0]
-		for _, leg := range s.Legs[1:] {
-			switch {
-			case worst.LastBarTS.IsZero() && !leg.LastBarTS.IsZero(): // prefer a leg that has data
-				worst = leg
-			case !leg.LastBarTS.IsZero() && leg.LastBarTS.Before(worst.LastBarTS): // then the oldest
-				worst = leg
-			}
-		}
-		dir, sym = worst.Inference, worst.Symbol
+	tabs := detailTabs(s)
+	m.detailID, m.detailTab, m.detailOpen = s.SystemID, stalestTab(tabs), true
+	m.sysPane = logPane{key: s.LogPaths.Text}
+	m.infPane = logPane{}
+	if t := m.detailTab; t < len(tabs) {
+		m.infPane.key = tabs[t].inference
 	}
-	if dir == "" {
-		m.status = "no inference log for " + s.SystemID
-		return
-	}
-	m.logDir, m.logPath = dir, "" // the dated file is resolved per read (follows the midnight rollover)
-	m.logTitle = s.SystemID
-	if sym != "" {
-		m.logTitle += " [" + sym + "]"
-	}
-	m.logLines, m.logErr, m.logOpen = nil, nil, true
 }
 
-// logViewport is how many tail lines fit below the screen chrome (title/path/footer); a sane default
-// before the first WindowSizeMsg arrives.
-func (m model) logViewport() int {
-	const chrome = 7
-	if m.height > chrome+3 {
-		return m.height - chrome
-	}
-	return 20
+func (m *model) closeDetail() {
+	m.detailOpen, m.detailID, m.detailTab = false, "", 0
+	m.sysPane, m.infPane = logPane{}, logPane{}
 }
 
-func (m model) logView() string {
-	path := m.logPath
-	if path == "" { // before the first read resolves today's file
-		path = m.logDir
+// cycleTab moves the active inference tab by d (wrapping) and retargets the right pane.
+func (m model) cycleTab(d int) (tea.Model, tea.Cmd) {
+	s, ok := m.detailSystem()
+	if !ok {
+		return m, nil
 	}
-	lines := []string{m.titleBar("log · " + m.logTitle), "", dimStyle.Render(path), ""}
-	switch {
-	case m.logErr != nil:
-		lines = append(lines, alertStyle.Render("read error: "+m.logErr.Error()))
-	case len(m.logLines) == 0:
-		lines = append(lines, dimStyle.Render("(waiting for log lines — no bar written yet today)"))
-	default:
-		body := m.logLines
-		if limit := m.logViewport(); len(body) > limit {
-			body = body[len(body)-limit:]
-		}
-		for _, l := range body {
-			if m.width > 0 { // keep long JSONL records from wrapping and breaking the layout
-				l = truncate(l, m.width)
-			}
-			lines = append(lines, l)
+	tabs := detailTabs(s)
+	if len(tabs) <= 1 {
+		return m, nil
+	}
+	m.detailTab = (m.detailTab + d + len(tabs)) % len(tabs)
+	m.infPane = logPane{key: tabs[m.detailTab].inference}
+	if m.infPane.key == "" {
+		return m, nil
+	}
+	return m, readInferenceTail(m.infPane.key)
+}
+
+func (m *model) submitDetail(action string) {
+	if id, err := ipc.SubmitCommand(m.cfg.CommandsDir(), action, m.detailID); err == nil {
+		m.pending[id] = pendingCmd{action: action, systemID: m.detailID}
+		m.status = fmt.Sprintf("submitted %s for %s", action, m.detailID)
+	} else {
+		m.status = "submit failed: " + err.Error()
+	}
+}
+
+// detailReads are the tea.Cmds that refresh both panes (skipping a pane with no target).
+func (m model) detailReads() []tea.Cmd {
+	var cmds []tea.Cmd
+	if m.sysPane.key != "" {
+		cmds = append(cmds, readTextTail(m.sysPane.key))
+	}
+	if m.infPane.key != "" {
+		cmds = append(cmds, readInferenceTail(m.infPane.key))
+	}
+	return cmds
+}
+
+// stalestTab picks the tab to open by default: the leg with the oldest bar (preferring one that has
+// data), i.e. the one most likely wedged.
+func stalestTab(tabs []infTab) int {
+	best := 0
+	for i := 1; i < len(tabs); i++ {
+		switch {
+		case tabs[best].lastBar.IsZero() && !tabs[i].lastBar.IsZero():
+			best = i
+		case !tabs[i].lastBar.IsZero() && tabs[i].lastBar.Before(tabs[best].lastBar):
+			best = i
 		}
 	}
-	lines = append(lines, "", dimStyle.Render("live tail · refreshes every 2s · esc/l back · q quit"))
+	return best
+}
+
+func (m model) detailView() string {
+	s, ok := m.detailSystem()
+	if !ok { // the system left the catalog while we were looking at it
+		return strings.Join([]string{m.titleBar("system"), "",
+			alertStyle.Render("  " + m.detailID + " is no longer in the fleet"), "",
+			hintBar(hint{"esc", "back"}, hint{"q", "quit"})}, "\n") + "\n"
+	}
+	tabs := detailTabs(s)
+	if m.detailTab >= len(tabs) { // legs shrank under us
+		m.detailTab = 0
+	}
+
+	// status panel
+	title := boxTitleStyle.Render("status") + "  " + dimStyle.Render(s.SystemID)
+	if s.Multi {
+		title += dimStyle.Render(fmt.Sprintf(" ·%dsym", len(tabs)))
+	}
+	statusBody := m.detailStatusBody(s)
+	badge := stateStyle(s.State).Render(stateLabel(s.State))
+	if b := healthBadge(m.sessionHealth(s.SessionID)); b != "" { // broker-session precondition (§13)
+		badge += "  " + b
+	}
+	statusBox := titledBox(title, badge, m.cols()-2, len(statusBody), statusBody)
+
+	// two side-by-side log panes filling the rest of the height
+	innerH := m.detailPaneHeight()
+	leftW := (m.cols() - 4) / 2
+	rightW := m.cols() - 4 - leftW
+	leftBox := titledBox(boxTitleStyle.Render("z_system_log"), "", leftW, innerH, paneLines(m.sysPane, leftW, innerH))
+	rightTitle := boxTitleStyle.Render("inference") + "  " + m.tabStrip(tabs)
+	rightBox := titledBox(rightTitle, "", rightW, innerH, paneLines(m.infPane, rightW, innerH))
+	panes := lipgloss.JoinHorizontal(lipgloss.Top, leftBox, rightBox)
+
+	lines := []string{m.titleBar("system"), "", statusBox, panes, ""}
+	if c := m.confirmBar(); c != "" {
+		lines = append(lines, c, "")
+	}
+	if m.status != "" {
+		lines = append(lines, m.statusStyle().Render(m.status), "")
+	}
+	lines = append(lines, hintBar(hint{"tab/←→", "switch symbol"},
+		hint{"s", "start"}, hint{"x", "stop"}, hint{"r", "restart"}, hint{"K", "kill"}, hint{"esc", "back"}, hint{"q", "quit"}))
 	return strings.Join(lines, "\n") + "\n"
 }
 
-// readLogTail resolves today's inference file under dir (re-resolved every read so the tail follows
-// the UTC-midnight rollover) and tails it.
-func readLogTail(dir string) tea.Cmd {
+// detailStatusBody is the two-row key/value grid of the status panel (state lives in the box badge).
+func (m model) detailStatusBody(s ipc.System) []string {
+	f := func(label, value string) string {
+		return lipgloss.NewStyle().Width(22).Render(dimStyle.Render(label+" ") + value)
+	}
+	val := func(v string) string {
+		if v == "" {
+			return dimStyle.Render("–")
+		}
+		return v
+	}
+	pid := "–"
+	if s.PID != 0 {
+		pid = strconv.Itoa(s.PID)
+	}
+	started := "–"
+	if !s.StartedAt.IsZero() {
+		started = s.StartedAt.UTC().Format("01-02 15:04Z")
+	}
+	age := "–"
+	if s.State == ipc.StateRunning && s.LastBarAgeS > 0 {
+		age = humanizeAge(s.LastBarTS)
+		if s.Multi {
+			age += " (stalest)"
+		}
+	}
+	wedged := okStyle.Render("no")
+	if s.Wedged {
+		w := "⚠ yes"
+		if sym := stalestWedgedSymbol(s); sym != "" {
+			w += " (" + sym + ")"
+		}
+		wedged = wedgeStyle.Render(w)
+	}
+	return []string{
+		"  " + f("PID", val(pid)) + f("Broker", val(s.Broker)) + f("Account", val(s.Account)) + f("Session", val(s.SessionID)),
+		"  " + f("Token", val(shortToken(s.StartToken))) + f("Started", val(started)) + f("Bar age", val(age)) + f("Wedged", wedged),
+	}
+}
+
+// tabStrip renders the inference symbol tabs into the right pane's border — active tab reverse-video,
+// each showing its own bar-age and a ⚠ if that leg is wedged.
+func (m model) tabStrip(tabs []infTab) string {
+	parts := make([]string, len(tabs))
+	for i, t := range tabs {
+		label := t.symbol
+		if age := humanizeAge(t.lastBar); age != "" {
+			label += " " + age
+		}
+		if t.wedged {
+			label += " ⚠"
+		}
+		if i == m.detailTab {
+			parts[i] = tabActiveStyle.Render(" " + label + " ")
+		} else {
+			parts[i] = tabStyle.Render(label)
+		}
+	}
+	return strings.Join(parts, dimStyle.Render(" · "))
+}
+
+// paneLines renders a pane's tail into innerH rows, each clipped to w (log lines are plain text, so
+// rune-truncation is safe).
+func paneLines(p logPane, w, innerH int) []string {
+	switch {
+	case p.err != nil:
+		return []string{alertStyle.Render(truncate("read error: "+p.err.Error(), w))}
+	case len(p.lines) == 0:
+		return []string{dimStyle.Render("(no log yet)")}
+	default:
+		body := p.lines
+		if len(body) > innerH {
+			body = body[len(body)-innerH:]
+		}
+		out := make([]string, len(body))
+		for i, l := range body {
+			out[i] = truncate(l, w)
+		}
+		return out
+	}
+}
+
+// detailPaneHeight is the inner height of the log panes — the screen minus the title/status/hint
+// chrome, so the panes fill the lower ~⅔.
+func (m model) detailPaneHeight() int {
+	return max(m.rows()-12, 3)
+}
+
+// shortToken trims a start token to a glanceable prefix.
+func shortToken(t string) string {
+	if len(t) > 10 {
+		return t[:8] + "…"
+	}
+	return t
+}
+
+// stalestWedgedSymbol names a wedged leg (for the status panel's Wedged annotation), "" if none.
+func stalestWedgedSymbol(s ipc.System) string {
+	for _, l := range s.Legs {
+		if l.Wedged {
+			return l.Symbol
+		}
+	}
+	return ""
+}
+
+// humanizeAge renders a compact age since t ("2s", "7m", "1h04m"), "" if t is zero.
+func humanizeAge(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	d := max(time.Since(t), 0)
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+}
+
+func readTextTail(path string) tea.Cmd {
+	return func() tea.Msg {
+		lines, err := tailFile(path, logTailMax)
+		return logTailMsg{pane: paneSys, key: path, path: path, lines: lines, err: err}
+	}
+}
+
+// readInferenceTail resolves today's inference file under dir (re-resolved every read so the tail
+// follows the UTC-midnight rollover) and tails it.
+func readInferenceTail(dir string) tea.Cmd {
 	return func() tea.Msg {
 		path := filepath.Join(dir, "inference_"+time.Now().UTC().Format("20060102")+".jsonl")
 		lines, err := tailFile(path, logTailMax)
-		return logTailMsg{dir: dir, path: path, lines: lines, err: err}
+		return logTailMsg{pane: paneInf, key: dir, path: path, lines: lines, err: err}
 	}
 }
 

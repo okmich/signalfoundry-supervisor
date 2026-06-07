@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
+	"github.com/okmich/signalfoundry-supervisor/internal/importsys"
 	"github.com/okmich/signalfoundry-supervisor/internal/ipc"
 )
 
@@ -79,13 +80,14 @@ func Run(cfg config.Config) error {
 }
 
 type model struct {
-	cfg     config.Config
-	fleet   ipc.FleetState
-	err     error
-	cursor  int                   // selected fleet row
-	confirm *confirmState         // non-nil while awaiting y/n for a bulk stop
-	pending map[string]pendingCmd // submitted command id -> what it was, to surface its result
-	status  string                // latest action / result line
+	cfg       config.Config
+	fleet     ipc.FleetState
+	err       error
+	cursor    int                   // selected fleet row
+	confirm   *confirmState         // non-nil while awaiting y/n for a bulk stop
+	importing *importState          // non-nil while the import dialog is open
+	pending   map[string]pendingCmd // submitted command id -> what it was, to surface its result
+	status    string                // latest action / result line
 
 	settingsOpen bool         // settings screen is showing
 	settings     ipc.Settings // editable copy (loaded on open, written on each change)
@@ -123,6 +125,15 @@ type confirmState struct {
 type pendingCmd struct {
 	action   string
 	systemID string
+}
+
+// importState drives the system-import dialog: the operator types a source folder, Enter validates it
+// into a Plan (import mode is purely a TUI client of importsys), then a y/n confirm gates the
+// archive+install. Closing the TUI mid-flow is safe — the install is a staged atomic rename.
+type importState struct {
+	input   string          // source path being typed (editing phase)
+	plan    *importsys.Plan // non-nil once validated -> confirm phase
+	errText string          // last validation error, shown inline
 }
 
 type tickMsg time.Time
@@ -223,6 +234,9 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.armBulkConfirm("stop")
 	case "R": // restart-all — confirm first (it is a fleet-wide stop too)
 		m.armBulkConfirm("restart")
+	case "i": // open the import-system dialog
+		m.importing = &importState{}
+		m.status = ""
 	case "c": // open the settings screen
 		m.openSettings()
 	case "l", "enter": // open the per-system details screen (Glance, §15) for the selected row

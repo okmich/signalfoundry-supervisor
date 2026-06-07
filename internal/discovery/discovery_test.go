@@ -49,3 +49,21 @@ func TestScanClassifiesSingleAndMulti(t *testing.T) {
 		t.Errorf("multi = %+v, want rsi2_mean_reversion-multi with 2 symbols", m)
 	}
 }
+
+// TestScanSkipsDotDirs verifies the importer's archive/staging subtrees (and any dot-dir) are not
+// mistaken for live systems even though they contain run.py copies.
+func TestScanSkipsDotDirs(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "strat", "EURUSD", "5", "run.py"), "")
+	// archived + staged copies hold run.py but must be invisible to discovery
+	write(t, filepath.Join(root, ".archive", "strat", "EURUSD", "5", "20200101T000000Z", "run.py"), "")
+	write(t, filepath.Join(root, ".staging", "strat_EURUSD_5", "run.py"), "")
+
+	cat, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cat) != 1 || cat[0].SystemID != "strat/EURUSD/5" {
+		t.Fatalf("want exactly the one live system, got %+v", cat)
+	}
+}

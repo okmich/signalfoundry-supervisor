@@ -189,6 +189,43 @@ func (p Plan) Apply(cfg config.Config) (archivedTo string, err error) {
 	return archivedTo, nil
 }
 
+// Decommission retires an installed system: it archives the system's LIVE_BASE artefact dir to
+// .archive (the inverse of an import) so discovery drops it from the fleet, and is reversible. It
+// refuses if the system is running. Returns the archive location. The system_id is the relative path
+// under LIVE_BASE for both a single-trader (<strategy>/<symbol>/<timeframe>) and a multi-trader
+// (<strategy>-multi), so it maps straight to the artefact dir.
+func Decommission(cfg config.Config, systemID string) (archivedTo string, err error) {
+	if strings.TrimSpace(systemID) == "" {
+		return "", fmt.Errorf("no system id given")
+	}
+	if err := ensureNotRunning(cfg, systemID); err != nil {
+		return "", err
+	}
+	rel := filepath.FromSlash(systemID)
+	target := filepath.Join(cfg.LiveBase, rel)
+	// Containment: an exported rename must never escape LIVE_BASE or hit LIVE_BASE itself, even if a
+	// bogus id (".", "..", "../x") slips in — a system_id="." would otherwise archive the whole tree.
+	if liveAbs, aerr := filepath.Abs(cfg.LiveBase); aerr == nil {
+		if tAbs, terr := filepath.Abs(target); terr != nil {
+			return "", terr
+		} else if r, rerr := filepath.Rel(liveAbs, tAbs); rerr != nil || r == "." || strings.HasPrefix(r, "..") {
+			return "", fmt.Errorf("invalid system id %q (resolves outside LIVE_BASE)", systemID)
+		}
+	}
+	if info, statErr := os.Stat(target); statErr != nil || !info.IsDir() {
+		return "", fmt.Errorf("system %q not found in LIVE_BASE (%s)", systemID, target)
+	}
+	ts := time.Now().UTC().Format("20060102T150405Z")
+	archivedTo = filepath.Join(cfg.LiveBase, ArchiveDir, rel, ts)
+	if err := os.MkdirAll(filepath.Dir(archivedTo), 0o755); err != nil {
+		return "", err
+	}
+	if err := os.Rename(target, archivedTo); err != nil {
+		return "", fmt.Errorf("archive (rename target->archive): %w", err)
+	}
+	return archivedTo, nil
+}
+
 // ensureNotRunning refuses if the registry shows the system_id bound to a live PID.
 func ensureNotRunning(cfg config.Config, systemID string) error {
 	reg, err := registry.Load(cfg.RegistryPath())

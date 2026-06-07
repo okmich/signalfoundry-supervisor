@@ -306,14 +306,97 @@ func TestConfirmGuardsStartAll(t *testing.T) {
 func testModel(t *testing.T) model {
 	t.Helper()
 	return model{
-		cfg:     config.Config{StateDir: t.TempDir()},
-		pending: map[string]pendingCmd{},
+		cfg:      config.Config{StateDir: t.TempDir()},
+		pending:  map[string]pendingCmd{},
+		awaiting: map[string]awaitStart{},
 		fleet: ipc.FleetState{Systems: []ipc.System{
 			{SystemID: "a/X/M5", State: ipc.StateRunning, PID: 1},
 			{SystemID: "b/Y/M5", State: ipc.StateStopped},
 			{SystemID: "c/Z/M5", State: ipc.StateRunning, PID: 2},
 			{SystemID: "d/W/M5", State: ipc.StateStoppedByOp},
 		}},
+	}
+}
+
+// D decommissions a stopped system: confirm, then its LIVE_BASE artefact is archived & removed.
+func TestDecommissionGatedAndArchives(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state")}
+	sysDir := filepath.Join(cfg.LiveBase, "s", "EURUSD", "15")
+	if err := os.MkdirAll(sysDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysDir, "run.py"), []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := model{cfg: cfg, pending: map[string]pendingCmd{}, awaiting: map[string]awaitStart{},
+		fleet: ipc.FleetState{Systems: []ipc.System{{SystemID: "s/EURUSD/15", State: ipc.StateStopped}}}}
+	m.cursor = 0
+
+	armed, _ := m.handleKey(key("D"))
+	mm := armed.(model)
+	if mm.confirm == nil || mm.confirm.action != "decommission" || mm.confirm.systemID != "s/EURUSD/15" {
+		t.Fatalf("D should arm a decommission confirm, got %+v", mm.confirm)
+	}
+	confirmed, _ := mm.handleKey(key("y"))
+	cm := confirmed.(model)
+	if _, err := os.Stat(sysDir); !os.IsNotExist(err) {
+		t.Errorf("artefact dir should be archived/removed after decommission")
+	}
+	if !strings.Contains(cm.status, "decommissioned") {
+		t.Errorf("status = %q, want a decommissioned result", cm.status)
+	}
+}
+
+// D on a running system refuses (no confirm) and tells the operator to stop it first.
+func TestDecommissionRefusedWhileRunning(t *testing.T) {
+	m := testModel(t)
+	m.cursor = 0 // a/X/M5 Running, PID 1
+	armed, _ := m.handleKey(key("D"))
+	mm := armed.(model)
+	if mm.confirm != nil {
+		t.Errorf("D on a running system must not arm a confirm")
+	}
+	if !strings.Contains(mm.status, "stop") {
+		t.Errorf("status = %q, want a 'stop first' hint", mm.status)
+	}
+}
+
+// A started system that ends up Crashed self-corrects the status away from the optimistic "starting".
+func TestStartStatusSelfCorrectsToFailure(t *testing.T) {
+	m := testModel(t)
+	m.awaiting = map[string]awaitStart{
+		"a/X/M5": {action: "start", deadline: time.Now().Add(time.Minute), sawActive: true},
+	}
+	m.fleet.Systems[0].State = ipc.StateCrashed
+	m.reconcileAwaiting()
+	if _, still := m.awaiting["a/X/M5"]; still {
+		t.Error("awaiting should clear once the system settles")
+	}
+	if !strings.Contains(m.status, "FAILED") {
+		t.Errorf("status = %q, want a FAILED outcome", m.status)
+	}
+}
+
+// A started system that reaches Running self-corrects to a success line.
+func TestStartStatusSelfCorrectsToRunning(t *testing.T) {
+	m := testModel(t)
+	m.awaiting = map[string]awaitStart{"b/Y/M5": {action: "start", deadline: time.Now().Add(time.Minute)}}
+	m.fleet.Systems[1].State = ipc.StateRunning // b/Y/M5
+	m.reconcileAwaiting()
+	if !strings.Contains(m.status, "running") {
+		t.Errorf("status = %q, want running ✓", m.status)
+	}
+}
+
+// Pre-start grace: a system still Stopped (engine hasn't picked up the command), not yet seen active
+// and before the deadline, must NOT be reported as a failure.
+func TestStartStatusGraceBeforeActive(t *testing.T) {
+	m := testModel(t)
+	m.awaiting = map[string]awaitStart{"b/Y/M5": {action: "start", deadline: time.Now().Add(time.Minute)}}
+	m.reconcileAwaiting() // b/Y/M5 is Stopped in testModel
+	if _, still := m.awaiting["b/Y/M5"]; !still {
+		t.Error("should keep waiting during the pre-start grace, not report failure")
 	}
 }
 

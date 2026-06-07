@@ -124,7 +124,7 @@ func TestApplyCopiesSkipsJunkAndArchives(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "src")
 	writeFile(t, filepath.Join(src, "run.py"), "print()")
 	writeFile(t, filepath.Join(src, "config.json"), `{"strategy":{"name":"s","symbol":"EURUSD","timeframe":15},"strategies":[]}`)
-	writeFile(t, filepath.Join(src, "model.json"), `{}`)              // a real artefact
+	writeFile(t, filepath.Join(src, "model.json"), `{}`)             // a real artefact
 	writeFile(t, filepath.Join(src, "__pycache__", "x.pyc"), "junk") // build noise
 	writeFile(t, filepath.Join(src, "z_system_log_123.log"), "junk") // transient runner log
 
@@ -177,6 +177,81 @@ func TestApplyCopiesSkipsJunkAndArchives(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(p2.TargetDir, "run.py")); err != nil {
 		t.Errorf("reinstalled copy missing run.py: %v", err)
+	}
+}
+
+func TestDecommissionArchivesAndRemoves(t *testing.T) {
+	cfg := testCfg(t)
+	src := srcWith(t, `{"strategy":{"name":"s","symbol":"EURUSD","timeframe":15},"strategies":[]}`)
+	p, err := BuildPlan(cfg, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	archived, err := Decommission(cfg, p.SystemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p.TargetDir); !os.IsNotExist(err) {
+		t.Errorf("artefact should be gone from LIVE_BASE after decommission")
+	}
+	if !strings.Contains(archived, ArchiveDir) {
+		t.Errorf("archive path should be under %s, got %q", ArchiveDir, archived)
+	}
+	if _, err := os.Stat(filepath.Join(archived, "run.py")); err != nil {
+		t.Errorf("archived copy missing run.py: %v", err)
+	}
+}
+
+func TestDecommissionRefusesRunning(t *testing.T) {
+	cfg := testCfg(t)
+	src := srcWith(t, `{"strategy":{"name":"s","symbol":"EURUSD","timeframe":15},"strategies":[]}`)
+	p, _ := BuildPlan(cfg, src)
+	if _, err := p.Apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reg := registry.Registry{Entries: map[string]registry.Entry{
+		p.SystemID: {SystemID: p.SystemID, PID: os.Getpid()}, // this process == definitely alive
+	}}
+	if err := registry.Save(cfg.RegistryPath(), reg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decommission(cfg, p.SystemID); err == nil || !strings.Contains(err.Error(), "running") {
+		t.Fatalf("want running refusal, got %v", err)
+	}
+	if _, err := os.Stat(p.TargetDir); err != nil {
+		t.Errorf("artefact must remain when decommission is refused: %v", err)
+	}
+}
+
+func TestDecommissionMissing(t *testing.T) {
+	cfg := testCfg(t)
+	if _, err := Decommission(cfg, "nope/X/5"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("want not-found error, got %v", err)
+	}
+}
+
+// A bogus id that resolves to LIVE_BASE itself or escapes it must be rejected, never archived — guards
+// the exported os.Rename against ".", "..", and traversal ids.
+func TestDecommissionRejectsTraversal(t *testing.T) {
+	cfg := testCfg(t)
+	if err := os.MkdirAll(cfg.LiveBase, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{".", "..", "../escape", "a/../.."} {
+		if _, err := Decommission(cfg, id); err == nil {
+			t.Errorf("id %q should be rejected", id)
+		}
+	}
+	// LIVE_BASE itself must still exist (nothing was archived/moved).
+	if _, err := os.Stat(cfg.LiveBase); err != nil {
+		t.Errorf("LIVE_BASE must be untouched: %v", err)
 	}
 }
 

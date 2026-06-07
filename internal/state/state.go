@@ -38,12 +38,10 @@ func Reconcile(cfg config.Config) []ipc.System {
 			Multi:     c.Multi,
 			Symbols:   c.Symbols,
 			State:     ipc.StateStopped,
-			// TODO(unverified): the framework defines no standard text-log file — `setup_logging` is
-			// never called and `z_system_log.log` does not exist in it. Only the inference JSONL is
-			// contract-backed. This Text path is provisional (the details left pane degrades to "(no
-			// log yet)" when absent); confirm the real layout against live run artifacts before relying
-			// on it — it may instead be the §15 raw-stdout ops capture.
-			LogPaths: ipc.LogPaths{Status: statusPath, Text: filepath.Join(c.Dir, "z_system_log.log")},
+			// Text log: the runner writes z_*_log_<ts>.log into the runner-root log dir under LOG_BASE
+			// (okmich_quant_core.setup_text_logger), beside status.json. Resolve the newest each tick;
+			// "" -> the details left pane degrades to "(no log yet)".
+			LogPaths: ipc.LogPaths{Status: statusPath, Text: newestTextLog(filepath.Dir(statusPath))},
 		}
 		if !c.Multi {
 			s.LogPaths.Inference = contract.InferenceDir(cfg.LogBase, c.RunnerStrategy, c.Symbol, c.Timeframe)
@@ -88,6 +86,20 @@ func Reconcile(cfg config.Config) []ipc.System {
 		systems = append(systems, s)
 	}
 	return systems
+}
+
+// newestTextLog returns the most recent per-process text log (z_*_log_<ts>.log, written by the runner
+// via okmich_quant_core.setup_text_logger) in the runner-root log dir, or "" if none exists yet. The
+// timestamped names sort chronologically, so the lexically-greatest base name is the newest launch.
+func newestTextLog(runnerRootDir string) string {
+	matches, _ := filepath.Glob(filepath.Join(runnerRootDir, "z_*.log"))
+	newest := ""
+	for _, p := range matches {
+		if newest == "" || filepath.Base(p) > filepath.Base(newest) {
+			newest = p
+		}
+	}
+	return newest
 }
 
 // multiLegs builds one liveness leg per logical system of a multi-trader, reading each symbol's own

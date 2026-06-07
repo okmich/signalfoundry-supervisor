@@ -74,7 +74,7 @@ func stateStyle(st ipc.State) lipgloss.Style {
 
 // Run starts the TUI program.
 func Run(cfg config.Config) error {
-	m := model{cfg: cfg, pending: map[string]pendingCmd{}}
+	m := model{cfg: cfg, pending: map[string]pendingCmd{}, awaiting: map[string]awaitStart{}}
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
@@ -87,6 +87,7 @@ type model struct {
 	confirm   *confirmState         // non-nil while awaiting y/n for a bulk stop
 	importing *importState          // non-nil while the import dialog is open
 	pending   map[string]pendingCmd // submitted command id -> what it was, to surface its result
+	awaiting  map[string]awaitStart // system_id -> a start/restart we issued, watched until it settles
 	status    string                // latest action / result line
 
 	settingsOpen bool         // settings screen is showing
@@ -125,6 +126,18 @@ type confirmState struct {
 type pendingCmd struct {
 	action   string
 	systemID string
+}
+
+// awaitStart tracks a start/restart issued from the TUI until the system actually settles in fleet
+// state, so the status line reflects the REAL outcome (running / failed / never-started) instead of
+// the optimistic "starting" the engine acks at spawn time — the result IPC is one-shot, so the async
+// outcome only ever shows up in fleet state. sawActive guards the pre-start tick: a system still
+// Stopped because the engine hasn't picked up the command yet is not a failure until we've seen it go
+// active or the start deadline passes.
+type awaitStart struct {
+	action    string
+	deadline  time.Time
+	sawActive bool
 }
 
 // importState drives the system-import dialog: the operator types a source folder, Enter validates it
@@ -168,6 +181,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ipc.FleetState:
 		m.fleet, m.err = msg, nil
 		m.clampCursor()
+		m.reconcileAwaiting()
 		return m, nil
 	case errMsg:
 		m.err = msg.err
@@ -234,6 +248,8 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.armBulkConfirm("stop")
 	case "R": // restart-all — confirm first (it is a fleet-wide stop too)
 		m.armBulkConfirm("restart")
+	case "D": // decommission — archive the artefact & drop it from the fleet (confirmed; shift-D for friction)
+		m.armDecommissionConfirm(m.currentSystemID())
 	case "i": // open the import-system dialog
 		m.importing = &importState{}
 		m.status = ""
@@ -259,6 +275,12 @@ func (m model) handleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch c.action {
 	case "quit":
 		return m, tea.Quit
+	case "decommission": // a TUI-side filesystem op (a fast rename), not an engine command
+		if archived, err := importsys.Decommission(m.cfg, c.systemID); err != nil {
+			m.status = "decommission failed: " + err.Error()
+		} else {
+			m.status = fmt.Sprintf("decommissioned %s → archived %s", c.systemID, filepath.Base(archived))
+		}
 	case "start", "stop", "restart", "kill":
 		if c.bulk {
 			m.submitBulk(c.action)
@@ -368,7 +390,7 @@ func (m model) fleetView() string {
 	}
 	lines = append(lines, "", hintBar(
 		hint{"↑↓", "select"}, hint{"s", "start"}, hint{"x", "stop"}, hint{"r", "restart"}, hint{"K", "kill"},
-		hint{"S/X/R", "all"}, hint{"l", "details"}, hint{"c", "config"}, hint{"q", "quit"},
+		hint{"S/X/R", "all"}, hint{"i", "import"}, hint{"D", "decommission"}, hint{"l", "details"}, hint{"c", "config"}, hint{"q", "quit"},
 	))
 	return strings.Join(lines, "\n") + "\n"
 }
@@ -384,6 +406,8 @@ func (m model) confirmBar() string {
 	switch {
 	case c.action == "quit":
 		what = "Quit the supervisor"
+	case c.action == "decommission":
+		what = fmt.Sprintf("DECOMMISSION %s (archive & remove from the fleet)", c.systemID)
 	case c.action == "kill":
 		what = fmt.Sprintf("KILL %s (force — skips graceful shutdown)", c.systemID)
 	case c.bulk:
@@ -544,6 +568,62 @@ func (m *model) armSingleConfirm(action, systemID string) {
 // armQuit gates closing the TUI behind y/n (an errant q / ctrl+c must not exit).
 func (m *model) armQuit() { m.confirm = &confirmState{action: "quit"} }
 
+// armDecommissionConfirm gates retiring a system (archive its LIVE_BASE dir, drop it from the fleet).
+// Refused while the system is active — stop it first; the archive is reversible.
+func (m *model) armDecommissionConfirm(systemID string) {
+	if systemID == "" {
+		return
+	}
+	if s, ok := systemByID(m.fleet.Systems, systemID); ok && (s.PID != 0 ||
+		s.State == ipc.StateRunning || s.State == ipc.StateStarting ||
+		s.State == ipc.StateStopping || s.State == ipc.StateRestarting) {
+		m.status = "stop " + systemID + " before decommissioning"
+		return
+	}
+	m.confirm = &confirmState{action: "decommission", systemID: systemID}
+}
+
+// systemByID finds a system in the fleet by its id.
+func systemByID(systems []ipc.System, id string) (ipc.System, bool) {
+	for _, s := range systems {
+		if s.SystemID == id {
+			return s, true
+		}
+	}
+	return ipc.System{}, false
+}
+
+// reconcileAwaiting rewrites the status for a start/restart we issued once the system settles in
+// fleet state — running -> success, crashed -> failed, and a fall back to a stopped state (after it
+// went active, or once the start deadline passes) -> didn't start. Corrects the optimistic "starting".
+func (m *model) reconcileAwaiting() {
+	for id, aw := range m.awaiting {
+		s, ok := systemByID(m.fleet.Systems, id)
+		if !ok { // not in the fleet (yet) — give up only once the deadline passes
+			if time.Now().After(aw.deadline) {
+				delete(m.awaiting, id)
+			}
+			continue
+		}
+		switch s.State {
+		case ipc.StateRunning:
+			m.status = fmt.Sprintf("%s %s → running ✓", aw.action, id)
+			delete(m.awaiting, id)
+		case ipc.StateCrashed, ipc.StateCrashLoopHalted:
+			m.status = fmt.Sprintf("%s %s → FAILED (%s)", aw.action, id, stateLabel(s.State))
+			delete(m.awaiting, id)
+		case ipc.StateStarting, ipc.StateRestarting:
+			aw.sawActive = true
+			m.awaiting[id] = aw
+		default: // Stopped / StoppedByOperator / OrphanSuspected / Stopping
+			if aw.sawActive || time.Now().After(aw.deadline) {
+				m.status = fmt.Sprintf("%s %s → did not start (now %s)", aw.action, id, stateLabel(s.State))
+				delete(m.awaiting, id)
+			}
+		}
+	}
+}
+
 // submitBulk fans out one single-system command per eligible target (§11.1: bulk is a fan-out, not
 // a new command shape). Eligibility: start-all -> Stopped; stop-all / restart-all -> Running.
 func (m *model) submitBulk(action string) {
@@ -598,6 +678,14 @@ func (m *model) resolvePending() {
 		}
 		if res.Accepted {
 			m.status = fmt.Sprintf("%s %s → %s", pc.action, pc.systemID, res.Outcome)
+			// The "starting"/"restarting" ack is optimistic — track it so the status self-corrects to
+			// the real outcome (running/failed) from fleet state (the result IPC is one-shot).
+			if pc.action == "start" || pc.action == "restart" {
+				if m.awaiting == nil {
+					m.awaiting = map[string]awaitStart{}
+				}
+				m.awaiting[pc.systemID] = awaitStart{action: pc.action, deadline: time.Now().Add(m.cfg.StartTimeout + 5*time.Second)}
+			}
 		} else {
 			m.status = fmt.Sprintf("%s %s → REJECTED: %s", pc.action, pc.systemID, res.Error)
 		}

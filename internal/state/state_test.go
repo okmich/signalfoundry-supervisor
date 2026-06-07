@@ -11,6 +11,23 @@ import (
 	"github.com/okmich/signalfoundry-supervisor/internal/ipc"
 )
 
+func TestNewestTextLog(t *testing.T) {
+	dir := t.TempDir()
+	// none yet -> empty (details pane degrades to "(no log yet)")
+	if got := newestTextLog(dir); got != "" {
+		t.Errorf("no logs should yield \"\", got %q", got)
+	}
+	// timestamped names sort chronologically -> newest is the lexically-greatest
+	for _, name := range []string{"z_system_log_250101120000.log", "z_system_log_250607093000.log", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := newestTextLog(dir); filepath.Base(got) != "z_system_log_250607093000.log" {
+		t.Errorf("newestTextLog = %q, want the newest z_*.log", got)
+	}
+}
+
 // A runner's status.json covers only the symbols in its logical_systems[]. A sibling row under the
 // same strategy that the runner does NOT cover must stay Stopped — it must not inherit the runner's
 // live PID/state (which would make it a wrong stop/kill target).

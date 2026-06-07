@@ -4,10 +4,10 @@ package proc
 
 import (
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -56,15 +56,35 @@ func ctrlcSysProcAttr() *syscall.SysProcAttr {
 }
 
 // Spawn launches a system's run.py in its OWN console (CREATE_NEW_CONSOLE), so it can be targeted
-// individually by SendCtrlC without disturbing siblings.
-func Spawn(python, runPy string, args ...string) (*exec.Cmd, error) {
-	cmd := exec.Command(python, append([]string{runPy}, args...)...)
-	cmd.Dir = filepath.Dir(runPy) // run from the artefact dir (OPS convention: `cd <dir>; python run.py`)
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_CONSOLE}
-	if err := cmd.Start(); err != nil {
-		return nil, err
+// individually by SendCtrlC without disturbing siblings. The console opens MINIMIZED and unfocused
+// (SW_SHOWMINNOACTIVE) so a fleet start does not blanket the desktop with foreground windows — it
+// stays a taskbar entry the operator can restore. We go through CreateProcess directly because
+// os/exec only exposes HideWindow (SW_HIDE, fully hidden); a hidden console is harder to inspect and
+// loses the taskbar entry. Returns the child PID; the process handle is intentionally not retained —
+// control is by PID and the child must outlive the supervisor (FLEET_SUPERVISOR_SPEC §6).
+func Spawn(python, runPy string, args ...string) (int, error) {
+	cmdline := windows.ComposeCommandLine(append([]string{python, runPy}, args...))
+	clPtr, err := windows.UTF16PtrFromString(cmdline)
+	if err != nil {
+		return 0, err
 	}
-	return cmd, nil
+	dirPtr, err := windows.UTF16PtrFromString(filepath.Dir(runPy)) // OPS convention: cd <dir>; python run.py
+	if err != nil {
+		return 0, err
+	}
+	// STARTF_USESHOWWINDOW makes CreateProcess honor ShowWindow; SW_SHOWMINNOACTIVE opens the console
+	// minimized without stealing focus from the foreground window.
+	si := &windows.StartupInfo{Flags: windows.STARTF_USESHOWWINDOW, ShowWindow: windows.SW_SHOWMINNOACTIVE}
+	si.Cb = uint32(unsafe.Sizeof(*si))
+	var pi windows.ProcessInformation
+	// lpEnvironment=nil -> inherit the engine's environment (so the child sees OKMICH_QUANT_* roots).
+	if err := windows.CreateProcess(nil, clPtr, nil, nil, false,
+		windows.CREATE_NEW_CONSOLE, nil, dirPtr, si, &pi); err != nil {
+		return 0, err
+	}
+	_ = windows.CloseHandle(pi.Thread)
+	_ = windows.CloseHandle(pi.Process) // not retained — closing the handle does not terminate the child
+	return int(pi.ProcessId), nil
 }
 
 // Alive reports whether pid is a currently-running process.

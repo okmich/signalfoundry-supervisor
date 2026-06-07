@@ -88,6 +88,13 @@ Windows integration scripts under `_dev/`; builds on windows/linux/darwin).
   pluggable (`internal/session`): a per-broker `Adapter` (the real MT5/IB probe, not yet built) with a
   file-backed operator override (`session_health.json`) as the stand-in + maintenance lockout. With no
   adapter/override, sessions are `unknown` and the gate allows (absence of a probe never blocks).
+- **Import / decommission** — operator-driven, engine-independent (`internal/importsys`, TUI `i`):
+  validate a source artefact dir, archive any existing copy, install into `LIVE_BASE` via a staged
+  atomic rename (the engine re-discovers it read-only next tick); decommission is the inverse.
+- **Env passthrough** — the engine spawns each `run.py` inheriting `OKMICH_QUANT_ENV_DIR`, so the
+  system resolves its own broker `.env` from that root with no flags. The trading systems' `run.py`
+  default `--env-file` now resolves against `OKMICH_QUANT_ENV_DIR` (falling back to the artefact dir
+  only when the var is unset), so a Supervisor-spawned (argument-less) launch and a manual launch agree.
 
 **Deferred:**
 

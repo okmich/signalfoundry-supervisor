@@ -17,13 +17,13 @@ func SendCtrlC(pid uint32) error {
 	return errors.New("SendCtrlC: console Ctrl+C control is only implemented on Windows")
 }
 
-func Spawn(python, runPy string, args ...string) (*exec.Cmd, error) {
+func Spawn(python, runPy string, args ...string) (int, error) {
 	cmd := exec.Command(python, append([]string{runPy}, args...)...)
 	cmd.Dir = filepath.Dir(runPy)
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return 0, err
 	}
-	return cmd, nil
+	return cmd.Process.Pid, nil
 }
 
 func Alive(pid int) bool {

@@ -5,7 +5,10 @@
 > **Largely implemented** in this repo (`signalfoundry-supervisor`): MVP + re-attach (§12),
 > multi-trader with runner-level liveness (§15/§16), blast-radius (§7), a named-mutex singleton, and
 > the broker-session start-gate scaffold (§13/§14 — gate + override + UI; real MT5/IB probe pending);
-> see `../README.md` for the implementation status.
+> see `../README.md` for the implementation status. It also adds an operator-driven
+> import/decommission utility (TUI `i`) that provisions artefacts into `LIVE_BASE` via a staged atomic
+> rename. **Under live MT5 testing as of 2026-06-07** — single + multi-trader start/stop/restart via
+> the TUI on a Deriv-Demo terminal, and it is looking good.
 > Companion contracts (`LOGGING_CONTRACT.md`,
 > `OPS_REFERENCE_GUIDE.md`) live in the sibling `signalfoundry-lab` repo.
 > Scope: the per-box **Supervisor** (a process control plane for live trading
@@ -620,6 +623,13 @@ There is **no control directory** — control is a console event to a live PID (
   this root and refuses start if the broker env file is missing or does not satisfy
   the broker-session adapter's required keys. Env filenames/profile IDs are audit
   data; secret values are never logged.
+  - **MVP (2026-06-07).** The Supervisor spawns each `run.py` inheriting `OKMICH_QUANT_ENV_DIR`, and
+    the system resolves + loads its **own** broker `.env` from that root (its `--env-file` default
+    resolves against `<env_dir>`, falling back to the artefact dir only when the var is unset) — so no
+    flags are passed and a supervised launch matches a manual one. The Supervisor-side `env_profile`/
+    `env_file` resolution + start-refusal described above is part of the deferred broker-session gate
+    (§13/§14); the scaffold refuses start on a `red` session, but the real env/key pre-check arrives
+    with the per-broker probe.
 
 ### 16.1 Supervisor setup / bootstrap responsibilities
 

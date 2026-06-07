@@ -226,6 +226,9 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.detailOpen {
 		return m.handleDetailKey(k)
 	}
+	if m.importing != nil {
+		return m.handleImportKey(k)
+	}
 	switch k.String() {
 	case "q", "ctrl+c": // quitting is confirmed too (§ erroneous-keypress guard)
 		m.armQuit()
@@ -289,6 +292,58 @@ func (m model) handleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.submitBulk(c.action)
 		} else {
 			m.submitByID(c.action, c.systemID)
+		}
+	}
+	return m, nil
+}
+
+// handleImportKey drives the import dialog (FLEET_SUPERVISOR_SPEC §16, internal/importsys). Two phases
+// on importState: editing (type a source artefact dir; Enter validates it into a Plan via BuildPlan)
+// then confirm (the validated Plan is shown; y installs it via Apply). All work is a TUI-side
+// filesystem op — the engine then re-discovers LIVE_BASE read-only on its next tick, so no command is
+// issued. esc cancels from either phase; in confirm, any non-y key returns to editing to amend the path.
+func (m model) handleImportKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	im := m.importing
+	if im.plan != nil { // confirm phase
+		switch k.String() {
+		case "y", "Y":
+			archived, err := im.plan.Apply(m.cfg)
+			switch {
+			case err != nil:
+				m.status = "import failed: " + err.Error()
+			case archived != "":
+				m.status = fmt.Sprintf("imported %s (previous archived → %s)", im.plan.SystemID, filepath.Base(archived))
+			default:
+				m.status = "imported " + im.plan.SystemID
+			}
+			m.importing = nil
+		case "esc":
+			m.importing, m.status = nil, "import cancelled"
+		default: // any other key -> back to editing to amend the path
+			im.plan = nil
+		}
+		return m, nil
+	}
+	switch k.String() { // editing phase
+	case "esc":
+		m.importing, m.status = nil, "import cancelled"
+	case "enter":
+		if plan, err := importsys.BuildPlan(m.cfg, im.input); err != nil {
+			im.plan, im.errText = nil, err.Error()
+		} else {
+			im.plan, im.errText = &plan, ""
+		}
+	case "backspace":
+		if r := []rune(im.input); len(r) > 0 {
+			im.input = string(r[:len(r)-1])
+		}
+	case "ctrl+u": // clear the line
+		im.input = ""
+	case " ": // space is its own key type; Windows paths carry them ("Volatility 100 Index")
+		im.input += " "
+	default:
+		if k.Type == tea.KeyRunes { // printable input incl. a bulk paste (Runes carries all of it)
+			im.input += string(k.Runes)
 		}
 	}
 	return m, nil
@@ -369,6 +424,8 @@ func (m model) View() string {
 		return m.settingsView()
 	case m.detailOpen:
 		return m.detailView()
+	case m.importing != nil:
+		return m.importView()
 	default:
 		return m.fleetView()
 	}
@@ -800,6 +857,69 @@ func (m model) settingsView() string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
+// --- import system (§16) -----------------------------------------------------
+
+// importView renders the import dialog: the editing prompt (the source path being typed) or, once
+// BuildPlan succeeds, the validated Plan laid out for a y/n install confirm (FLEET_SUPERVISOR_SPEC §16).
+func (m model) importView() string {
+	im := m.importing
+	innerW := m.cols() - 2
+	var body []string
+	if im.plan == nil { // editing phase
+		disp := im.input
+		if maxw := innerW - 6; maxw > 4 && len([]rune(disp)) > maxw {
+			r := []rune(disp)
+			disp = "…" + string(r[len(r)-maxw+1:]) // tail-clip so the typed end stays visible
+		}
+		body = append(body,
+			dimStyle.Render("Source artefact directory to import into LIVE_BASE:"),
+			"",
+			"  "+selStyle.Render(disp)+cursorStyle.Render("█"),
+			"",
+		)
+		if im.errText != "" {
+			body = append(body, alertStyle.Render("✗ "+truncate(im.errText, innerW-2)))
+		} else {
+			body = append(body, dimStyle.Render(`Paste a path (Windows "Copy as path" quotes tolerated), then Enter to validate.`))
+		}
+	} else { // confirm phase
+		p := im.plan
+		kind := "single-trader"
+		if p.Multi {
+			kind = fmt.Sprintf("multi-trader · %d symbols", len(p.Symbols))
+		}
+		field := func(label, val string) string {
+			return "  " + dimStyle.Width(11).Render(label) + selStyle.Render(truncate(val, innerW-14))
+		}
+		body = append(body,
+			okStyle.Render("Validated — review, then install:"),
+			"",
+			field("type", kind),
+			field("system id", p.SystemID),
+			field("source", p.SourceDir),
+			field("target", p.TargetDir),
+		)
+		if p.Multi {
+			body = append(body, field("symbols", strings.Join(p.Symbols, ", ")))
+		}
+		if p.WillArchive {
+			body = append(body, "", alertStyle.Render("⚠ a copy already exists at the target — it is archived first"))
+		}
+	}
+	box := titledBox(boxTitleStyle.Render("import system"), dimStyle.Render("provision into LIVE_BASE · §16"), innerW, len(body), body)
+
+	lines := []string{m.titleBar("import"), "", box, ""}
+	if m.status != "" {
+		lines = append(lines, m.statusStyle().Render(m.status))
+	}
+	if im.plan == nil {
+		lines = append(lines, "", hintBar(hint{"type", "source path"}, hint{"enter", "validate"}, hint{"ctrl+u", "clear"}, hint{"esc", "cancel"}))
+	} else {
+		lines = append(lines, "", hintBar(hint{"y", "install"}, hint{"any", "edit path"}, hint{"esc", "cancel"}))
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
 // --- system details (Glance, §15) --------------------------------------------
 
 const (
@@ -869,8 +989,43 @@ func (m *model) openDetail() {
 }
 
 func (m *model) closeDetail() {
-	m.detailOpen, m.detailID, m.detailTab = false, "", 0
+	m.detailOpen, m.detailID, m.detailTab, m.detailFocus = false, "", 0, 0
 	m.sysPane, m.infPane = logPane{}, logPane{}
+}
+
+// focusedPane returns the log pane the scroll keys currently drive (pointer receiver so callers
+// mutate the real panes, not a copy).
+func (m *model) focusedPane() *logPane {
+	if m.detailFocus == 1 {
+		return &m.infPane
+	}
+	return &m.sysPane
+}
+
+// scrollFocusedV moves the focused pane by delta lines toward older (positive) or newer (negative),
+// clamped to the buffered range; 0 means following the live tail.
+func (m *model) scrollFocusedV(delta int) {
+	p := m.focusedPane()
+	if len(p.lines) == 0 {
+		return
+	}
+	p.voff = max(0, min(p.voff+delta, len(p.lines)-1))
+}
+
+// scrollFocusedH moves the focused pane horizontally by delta columns, clamped to the longest line.
+func (m *model) scrollFocusedH(delta int) {
+	p := m.focusedPane()
+	p.hoff = max(0, min(p.hoff+delta, maxLineLen(p.lines)))
+}
+
+func maxLineLen(lines []string) int {
+	mx := 0
+	for _, l := range lines {
+		if n := len([]rune(l)); n > mx {
+			mx = n
+		}
+	}
+	return mx
 }
 
 // cycleTab moves the active inference tab by d (wrapping) and retargets the right pane.
@@ -946,9 +1101,15 @@ func (m model) detailView() string {
 	innerH := m.detailPaneHeight()
 	leftW := (m.cols() - 4) / 2
 	rightW := m.cols() - 4 - leftW
-	leftBox := titledBox(boxTitleStyle.Render("z_system_log"), "", leftW, innerH, paneLines(m.sysPane, leftW, innerH))
-	rightTitle := boxTitleStyle.Render("inference") + "  " + m.tabStrip(tabs)
-	rightBox := titledBox(rightTitle, "", rightW, innerH, paneLines(m.infPane, rightW, innerH))
+	leftLabel, rightLabel := boxTitleStyle.Render("z_system_log"), boxTitleStyle.Render("inference")
+	if m.detailFocus == 0 { // mark the focused pane's title
+		leftLabel = selStyle.Render("z_system_log")
+	} else {
+		rightLabel = selStyle.Render("inference")
+	}
+	leftBox := titledBox(leftLabel, scrollIndicator(m.sysPane), leftW, innerH, paneLines(m.sysPane, leftW, innerH))
+	rightTitle := rightLabel + "  " + m.tabStrip(tabs)
+	rightBox := titledBox(rightTitle, scrollIndicator(m.infPane), rightW, innerH, paneLines(m.infPane, rightW, innerH))
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, leftBox, rightBox)
 
 	lines := []string{m.titleBar("system"), "", statusBox, panes, ""}
@@ -958,9 +1119,22 @@ func (m model) detailView() string {
 	if m.status != "" {
 		lines = append(lines, m.statusStyle().Render(m.status), "")
 	}
-	lines = append(lines, hintBar(hint{"tab/←→", "switch symbol"},
-		hint{"s", "start"}, hint{"x", "stop"}, hint{"r", "restart"}, hint{"K", "kill"}, hint{"esc", "back"}, hint{"q", "quit"}))
+	lines = append(lines, hintBar(hint{"f", "focus pane"}, hint{"↑↓←→", "scroll"}, hint{"G", "live"},
+		hint{"tab", "symbol"}, hint{"s", "start"}, hint{"x", "stop"}, hint{"r", "restart"}, hint{"K", "kill"}, hint{"esc", "back"}))
 	return strings.Join(lines, "\n") + "\n"
+}
+
+// scrollIndicator shows a pane's scroll position in its title bar: "live" when following the tail, or
+// the up/right offsets (amber) when scrolled away from it.
+func scrollIndicator(p logPane) string {
+	if p.voff == 0 && p.hoff == 0 {
+		return dimStyle.Render("live")
+	}
+	s := fmt.Sprintf("↑%d", p.voff)
+	if p.hoff > 0 {
+		s += fmt.Sprintf(" →%d", p.hoff)
+	}
+	return wedgeStyle.Render(s)
 }
 
 // detailStatusBody is the two-row key/value grid of the status panel (state lives in the box badge).
@@ -1024,25 +1198,40 @@ func (m model) tabStrip(tabs []infTab) string {
 	return strings.Join(parts, dimStyle.Render(" · "))
 }
 
-// paneLines renders a pane's tail into innerH rows, each clipped to w (log lines are plain text, so
-// rune-truncation is safe).
+// paneLines renders a pane's visible window into innerH rows, honoring the scroll offsets: voff lines
+// up from the live bottom, hoff columns from the left. Each row is rune-clipped to w (log lines are
+// plain text). Offsets are clamped here too, so a stale offset after a live tail update never breaks.
 func paneLines(p logPane, w, innerH int) []string {
 	switch {
 	case p.err != nil:
 		return []string{alertStyle.Render(truncate("read error: "+p.err.Error(), w))}
 	case len(p.lines) == 0:
 		return []string{dimStyle.Render("(no log yet)")}
-	default:
-		body := p.lines
-		if len(body) > innerH {
-			body = body[len(body)-innerH:]
-		}
-		out := make([]string, len(body))
-		for i, l := range body {
-			out[i] = truncate(l, w)
-		}
-		return out
 	}
+	n := len(p.lines)
+	voff := max(0, min(p.voff, n-1))
+	end := n - voff // exclusive; >= 1 since voff <= n-1
+	start := max(0, end-innerH)
+	body := p.lines[start:end]
+	hoff := max(0, p.hoff)
+	out := make([]string, len(body))
+	for i, l := range body {
+		out[i] = truncate(hslice(l, hoff), w)
+	}
+	return out
+}
+
+// hslice drops the first off runes of s (horizontal scroll); rune-safe so a non-ASCII line is never
+// split mid-rune.
+func hslice(s string, off int) string {
+	if off <= 0 {
+		return s
+	}
+	r := []rune(s)
+	if off >= len(r) {
+		return ""
+	}
+	return string(r[off:])
 }
 
 // detailPaneHeight is the inner height of the log panes — the screen minus the title/status/hint

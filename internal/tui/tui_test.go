@@ -157,6 +157,61 @@ func TestOpenDetailPicksStalestTab(t *testing.T) {
 	t.Log("\n" + m.detailView())
 }
 
+// paneLines honors the vertical (voff) and horizontal (hoff) scroll offsets, clamping stale values.
+func TestPaneLinesScroll(t *testing.T) {
+	lines := []string{"line0", "line1", "line2", "line3", "line4"}
+
+	// no offset -> live tail (last innerH lines)
+	got := paneLines(logPane{lines: lines}, 80, 2)
+	if len(got) != 2 || !strings.Contains(got[1], "line4") {
+		t.Fatalf("live tail = %v", got)
+	}
+	// voff=2 -> window ends 2 from the bottom: line1,line2
+	got = paneLines(logPane{lines: lines, voff: 2}, 80, 2)
+	if len(got) != 2 || !strings.Contains(got[0], "line1") || !strings.Contains(got[1], "line2") {
+		t.Fatalf("voff=2 = %v", got)
+	}
+	// voff past the top clamps to the oldest line
+	got = paneLines(logPane{lines: lines, voff: 999}, 80, 2)
+	if len(got) != 1 || !strings.Contains(got[0], "line0") {
+		t.Fatalf("voff clamp = %v", got)
+	}
+	// hoff slices the left edge off (rune-safe)
+	got = paneLines(logPane{lines: []string{"abcdef"}, hoff: 3}, 80, 1)
+	if got[0] != "def" {
+		t.Fatalf("hoff slice = %q", got[0])
+	}
+}
+
+// Scroll keys drive the focused pane only; f toggles focus; G snaps back to the live tail. Routed via
+// press() (handleKey -> handleDetailKey since detailOpen), so it exercises the real dispatch.
+func TestDetailScrollKeys(t *testing.T) {
+	m := testModel(t)
+	m.detailOpen, m.detailFocus = true, 0 // focus the left (z_system_log) pane
+	m.sysPane = logPane{lines: []string{"a", "b", "c", "d", "e"}}
+	m.infPane = logPane{lines: []string{strings.Repeat("z", 40), "y"}} // long enough to scroll right
+
+	press := func(s string) { tm, _ := m.handleKey(key(s)); m = tm.(model) }
+
+	press("up") // scroll focused (sys) up
+	if m.sysPane.voff != 1 || m.infPane.voff != 0 {
+		t.Fatalf("up should scroll only the focused pane: sys=%d inf=%d", m.sysPane.voff, m.infPane.voff)
+	}
+	press("f") // toggle focus to inference
+	if m.detailFocus != 1 {
+		t.Fatalf("f should toggle focus, got %d", m.detailFocus)
+	}
+	press("right") // horizontal scroll the inference pane
+	if m.infPane.hoff != 8 || m.sysPane.hoff != 0 {
+		t.Fatalf("right should scroll only inf horizontally: inf=%d sys=%d", m.infPane.hoff, m.sysPane.hoff)
+	}
+	m.infPane.voff = 3
+	press("G") // snap back to live
+	if m.infPane.voff != 0 || m.infPane.hoff != 0 {
+		t.Fatalf("G should reset to live: voff=%d hoff=%d", m.infPane.voff, m.infPane.hoff)
+	}
+}
+
 func TestHealthBadge(t *testing.T) {
 	if healthBadge("unknown") != "" || healthBadge("") != "" {
 		t.Errorf("unknown/unprobed health should render no badge")
@@ -345,6 +400,91 @@ func TestDecommissionGatedAndArchives(t *testing.T) {
 	}
 	if !strings.Contains(cm.status, "decommissioned") {
 		t.Errorf("status = %q, want a decommissioned result", cm.status)
+	}
+}
+
+// The import dialog ('i') must render and capture input. Regression: the dialog was unwired — 'i' set
+// importState with no View case and no key handler, so it silently did nothing on screen.
+func TestImportDialogWiring(t *testing.T) {
+	m := model{cfg: config.Config{StateDir: t.TempDir(), LiveBase: t.TempDir()}, pending: map[string]pendingCmd{}, width: 92}
+	press := func(k tea.KeyMsg) { tm, _ := m.handleKey(k); m = tm.(model) }
+
+	press(key("i"))
+	if m.importing == nil {
+		t.Fatal("pressing i did not open the import dialog")
+	}
+	if out := m.View(); !strings.Contains(out, "import system") || !strings.Contains(out, "LIVE_BASE") {
+		t.Fatalf("View() did not render the import dialog:\n%s", out)
+	}
+
+	// Keys route to the dialog, not the fleet shortcuts: 'q' types a char, it does not quit.
+	press(key("q"))
+	press(key("x"))
+	press(key("/no/such/dir"))
+	if m.importing == nil {
+		t.Fatal("typing leaked to the fleet shortcuts — the dialog closed")
+	}
+	if got := m.importing.input; got != "qx/no/such/dir" {
+		t.Fatalf("input not captured verbatim: %q", got)
+	}
+
+	// Enter validates; a bad path surfaces an inline error and keeps the dialog open.
+	press(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.importing == nil || m.importing.plan != nil || m.importing.errText == "" {
+		t.Fatalf("a bad path should set errText and stay in editing, got %+v", m.importing)
+	}
+	if !strings.Contains(m.View(), "✗") {
+		t.Error("the validation error is not shown in the import view")
+	}
+
+	// esc cancels back to the fleet.
+	press(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.importing != nil {
+		t.Error("esc did not close the import dialog")
+	}
+}
+
+// Full import flow: type a valid source dir → Enter validates it into a Plan (confirm phase renders the
+// system id) → y installs it into LIVE_BASE via importsys.
+func TestImportInstallsValidatedSystem(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state")}
+	src := filepath.Join(dir, "incoming", "rsi2")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "run.py"), []byte("# run"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "config.json"),
+		[]byte(`{"strategy":{"name":"rsi2","symbol":"EURUSD","timeframe":5}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := model{cfg: cfg, pending: map[string]pendingCmd{}, width: 92}
+	press := func(k tea.KeyMsg) { tm, _ := m.handleKey(k); m = tm.(model) }
+
+	press(key("i"))
+	press(key(src))                       // type the source path
+	press(tea.KeyMsg{Type: tea.KeyEnter}) // validate
+	if m.importing == nil || m.importing.plan == nil {
+		t.Fatalf("a valid source should validate into a plan, got %+v", m.importing)
+	}
+	if m.importing.plan.SystemID != "rsi2/EURUSD/5" {
+		t.Fatalf("plan system id = %q, want rsi2/EURUSD/5", m.importing.plan.SystemID)
+	}
+	if out := m.View(); !strings.Contains(out, "rsi2/EURUSD/5") || !strings.Contains(out, "install") {
+		t.Fatalf("confirm view should show the system id and an install hint:\n%s", out)
+	}
+
+	press(key("y")) // install
+	if m.importing != nil {
+		t.Error("dialog should close after a successful install")
+	}
+	if !strings.Contains(m.status, "imported rsi2/EURUSD/5") {
+		t.Errorf("status = %q, want an imported result", m.status)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.LiveBase, "rsi2", "EURUSD", "5", "run.py")); err != nil {
+		t.Errorf("run.py should be installed under LIVE_BASE: %v", err)
 	}
 }
 

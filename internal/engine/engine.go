@@ -654,11 +654,7 @@ func resolveInterpreter(python string) (string, error) {
 // reconcileIdentities once the system reaches Running via status.json — not at spawn time, since the
 // spawned PID may be a launcher/shim, not the interpreter that writes status.json.
 func (e *engine) launch(_, runPy string) (int, error) {
-	cmd, err := proc.Spawn(e.cfg.Python, runPy)
-	if err != nil {
-		return 0, err
-	}
-	return cmd.Process.Pid, nil
+	return proc.Spawn(e.cfg.Python, runPy)
 }
 
 func isLiveOrInFlight(st ipc.State) bool {

@@ -6,9 +6,11 @@
 > multi-trader with runner-level liveness (§15/§16), blast-radius (§7), a named-mutex singleton, and
 > the broker-session start-gate scaffold (§13/§14 — gate + override + UI; real MT5/IB probe pending);
 > see `../README.md` for the implementation status. It also adds an operator-driven
-> import/decommission utility (TUI `i`) that provisions artefacts into `LIVE_BASE` via a staged atomic
-> rename. **Under live MT5 testing as of 2026-06-07** — single + multi-trader start/stop/restart via
-> the TUI on a Deriv-Demo terminal, and it is looking good.
+> import/decommission utility (TUI `i` to import, `D` to decommission) that provisions artefacts into
+> `LIVE_BASE` via a staged atomic rename — both fully wired into the TUI (dialog + confirm) and covered
+> by regression tests. **Under live MT5 testing as of 2026-06-07** — single + multi-trader
+> start/stop/restart, import, and decommission exercised via the TUI on a Deriv-Demo terminal, and it
+> is looking good.
 > Companion contracts (`LOGGING_CONTRACT.md`,
 > `OPS_REFERENCE_GUIDE.md`) live in the sibling `signalfoundry-lab` repo.
 > Scope: the per-box **Supervisor** (a process control plane for live trading

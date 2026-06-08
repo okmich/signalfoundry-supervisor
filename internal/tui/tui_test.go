@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -488,6 +489,44 @@ func TestImportInstallsValidatedSystem(t *testing.T) {
 	}
 }
 
+// A clipboard paste that interleaves NUL bytes (a mis-decoded UTF-16 path) must not poison the source
+// path: the dialog strips control runes so filepath.Abs resolves instead of failing "invalid argument".
+func TestImportStripsControlRunesFromPaste(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state")}
+	src := filepath.Join(dir, "incoming", "rsi2")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "run.py"), []byte("# run"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "config.json"),
+		[]byte(`{"strategy":{"name":"rsi2","symbol":"EURUSD","timeframe":5}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A NUL after every rune (and trailing), as a bad UTF-16 clipboard decode would deliver it.
+	var pasted []rune
+	for _, r := range src {
+		pasted = append(pasted, r, '\x00')
+	}
+	m := model{cfg: cfg, importing: &importState{}, pending: map[string]pendingCmd{}, width: 92}
+	press := func(k tea.KeyMsg) { tm, _ := m.handleKey(k); m = tm.(model) }
+
+	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: pasted})
+	if strings.ContainsRune(m.importing.input, '\x00') {
+		t.Fatalf("input still holds a NUL after paste: %q", m.importing.input)
+	}
+	if m.importing.input != src {
+		t.Fatalf("stripped input = %q, want %q", m.importing.input, src)
+	}
+	press(tea.KeyMsg{Type: tea.KeyEnter}) // validate
+	if m.importing == nil || m.importing.plan == nil {
+		t.Fatalf("a NUL-laden paste should still validate after stripping, got %+v (status=%q)", m.importing, m.status)
+	}
+}
+
 // D on a running system refuses (no confirm) and tells the operator to stop it first.
 func TestDecommissionRefusedWhileRunning(t *testing.T) {
 	m := testModel(t)
@@ -499,6 +538,19 @@ func TestDecommissionRefusedWhileRunning(t *testing.T) {
 	}
 	if !strings.Contains(mm.status, "stop") {
 		t.Errorf("status = %q, want a 'stop first' hint", mm.status)
+	}
+}
+
+// A Stopped(op) system that still carries its last PID (Reconcile keeps it for display) is NOT
+// active — D must arm the decommission confirm, not refuse with "stop first".
+func TestDecommissionAllowedWhenStoppedWithStalePID(t *testing.T) {
+	m := testModel(t)
+	m.cursor = 3 // d/W/M5 StoppedByOp — give it a retained PID, as a real Stopped(op) row has
+	m.fleet.Systems[3].PID = 9376
+	armed, _ := m.handleKey(key("D"))
+	mm := armed.(model)
+	if mm.confirm == nil || mm.confirm.action != "decommission" || mm.confirm.systemID != "d/W/M5" {
+		t.Fatalf("D on a Stopped(op) row with a stale PID should arm decommission, got %+v / status=%q", mm.confirm, mm.status)
 	}
 }
 
@@ -633,5 +685,42 @@ func TestResolvePendingSurfacesResult(t *testing.T) {
 	}
 	if !strings.Contains(m.status, "stopping") {
 		t.Errorf("status = %q, want it to surface the 'stopping' outcome", m.status)
+	}
+}
+
+// The details frame must never exceed the terminal height — even with a status line AND a pending
+// confirm present (the over-height frame scrolled the chrome off: the single-details bug).
+func TestDetailViewFitsTerminalHeight(t *testing.T) {
+	for _, rows := range []int{18, 24, 40, 60} {
+		m := testModel(t)
+		m.detailOpen, m.detailID = true, "a/X/M5"
+		m.width, m.height = 120, rows
+		lines := make([]string, 400)
+		for i := range lines {
+			lines[i] = "a log line"
+		}
+		m.sysPane.lines, m.infPane.lines = lines, lines
+		m.status = "start a/X/M5 did not start (now Stopped) some longer status text"
+		m.confirm = &confirmState{action: "stop", systemID: "a/X/M5"}
+		if got := len(strings.Split(m.detailView(), "\n")); got > rows {
+			t.Errorf("rows=%d: detail frame is %d lines, exceeds terminal height", rows, got)
+		}
+	}
+}
+
+// A runner's text log can contain non-UTF-8 bytes (a cp1252 em-dash, 0x97). tailFile must sanitize
+// them so raw bytes never reach the terminal and inflate the width (the single-details wide-screen bug).
+func TestTailFileSanitizesInvalidUTF8(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "x.log")
+	if err := os.WriteFile(path, []byte("Signal \x97 long=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := tailFile(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !utf8.ValidString(got[0]) {
+		t.Fatalf("tailFile must return valid UTF-8, got %q", got)
 	}
 }

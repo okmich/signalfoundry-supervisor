@@ -73,9 +73,17 @@ func Reconcile(cfg config.Config) []ipc.System {
 					if !s.LastBarTS.IsZero() {
 						s.LastBarAgeS = time.Since(s.LastBarTS).Seconds()
 					}
-				} else if ts, ok := contract.LastBarTS(s.LogPaths.Inference); ok {
-					s.LastBarTS = ts
-					s.LastBarAgeS = time.Since(ts).Seconds()
+				} else {
+					// Single-trader = a multi-of-one: publish ONE leg so the details view (and every
+					// other consumer) takes the SAME path as a multi-trader, not a single-only branch.
+					// Behavioral single/multi differences key on s.Multi, never on len(Legs).
+					leg := ipc.SystemLeg{Symbol: c.Symbol, Timeframe: c.Timeframe, Inference: s.LogPaths.Inference}
+					if ts, ok := contract.LastBarTS(s.LogPaths.Inference); ok {
+						leg.LastBarTS = ts
+						s.LastBarTS = ts
+						s.LastBarAgeS = time.Since(ts).Seconds()
+					}
+					s.Legs = []ipc.SystemLeg{leg}
 				}
 			case rs.State == "running" && !proc.Alive(rs.PID):
 				s.State = ipc.StateOrphanSuspected

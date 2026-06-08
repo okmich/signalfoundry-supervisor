@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -343,10 +344,23 @@ func (m model) handleImportKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		im.input += " "
 	default:
 		if k.Type == tea.KeyRunes { // printable input incl. a bulk paste (Runes carries all of it)
-			im.input += string(k.Runes)
+			im.input += stripControl(string(k.Runes))
 		}
 	}
 	return m, nil
+}
+
+// stripControl drops control/NUL runes from typed or pasted input. A clipboard paste can interleave
+// \x00 bytes (a mis-decoded UTF-16 path), which would otherwise reach filepath.Abs and fail with the
+// opaque "invalid argument" rather than resolving. Printable runes incl. spaces (Windows paths carry
+// them, e.g. "Volatility 100 Index") are kept.
+func stripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1 // drop
+		}
+		return r
+	}, s)
 }
 
 // handleDetailKey drives the details screen: tab/←→ cycle the inference symbol tabs, s/x/r/K control
@@ -654,13 +668,24 @@ func (m *model) armDecommissionConfirm(systemID string) {
 	if systemID == "" {
 		return
 	}
-	if s, ok := systemByID(m.fleet.Systems, systemID); ok && (s.PID != 0 ||
-		s.State == ipc.StateRunning || s.State == ipc.StateStarting ||
-		s.State == ipc.StateStopping || s.State == ipc.StateRestarting) {
+	if s, ok := systemByID(m.fleet.Systems, systemID); ok && activeState(s.State) {
 		m.status = "stop " + systemID + " before decommissioning"
 		return
 	}
 	m.confirm = &confirmState{action: "decommission", systemID: systemID}
+}
+
+// activeState reports whether a system is running, transitioning, or an unresolved orphan — states
+// from which it must not be retired. It keys off state alone, never s.PID: Reconcile retains the
+// last PID on a cleanly Stopped(op) row for display, so a non-zero PID is NOT proof of activity
+// (gating decommission on it wrongly refused a stopped system that still showed its old PID).
+func activeState(st ipc.State) bool {
+	switch st {
+	case ipc.StateRunning, ipc.StateStarting, ipc.StateStopping, ipc.StateRestarting, ipc.StateOrphanSuspected:
+		return true
+	default:
+		return false
+	}
 }
 
 // systemByID finds a system in the fleet by its id.
@@ -1097,8 +1122,11 @@ func (m model) detailView() string {
 	}
 	statusBox := titledBox(title, badge, m.cols()-2, len(statusBody), statusBody)
 
-	// two side-by-side log panes filling the rest of the height
-	innerH := m.detailPaneHeight()
+	// Size the two log panes to exactly what the chrome (title + status box + footer) leaves, so
+	// the frame never overflows the terminal and scrolls the chrome off-screen.
+	footer := detailFooter(m)
+	chrome := 2 + (len(statusBody) + 2) + len(footer) // title + blank + statusbox(+2 borders) + footer
+	innerH := max(m.rows()-chrome-2, 3)               // -2 = the panes' own top+bottom borders
 	leftW := (m.cols() - 4) / 2
 	rightW := m.cols() - 4 - leftW
 	leftLabel, rightLabel := boxTitleStyle.Render("z_system_log"), boxTitleStyle.Render("inference")
@@ -1112,16 +1140,9 @@ func (m model) detailView() string {
 	rightBox := titledBox(rightTitle, scrollIndicator(m.infPane), rightW, innerH, paneLines(m.infPane, rightW, innerH))
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, leftBox, rightBox)
 
-	lines := []string{m.titleBar("system"), "", statusBox, panes, ""}
-	if c := m.confirmBar(); c != "" {
-		lines = append(lines, c, "")
-	}
-	if m.status != "" {
-		lines = append(lines, m.statusStyle().Render(m.status), "")
-	}
-	lines = append(lines, hintBar(hint{"f", "focus pane"}, hint{"↑↓←→", "scroll"}, hint{"G", "live"},
-		hint{"tab", "symbol"}, hint{"s", "start"}, hint{"x", "stop"}, hint{"r", "restart"}, hint{"K", "kill"}, hint{"esc", "back"}))
-	return strings.Join(lines, "\n") + "\n"
+	lines := []string{m.titleBar("system"), "", statusBox, panes}
+	lines = append(lines, footer...)
+	return lipgloss.NewStyle().MaxWidth(m.cols()).MaxHeight(m.rows()).Render(strings.Join(lines, "\n"))
 }
 
 // scrollIndicator shows a pane's scroll position in its title bar: "live" when following the tail, or
@@ -1135,6 +1156,20 @@ func scrollIndicator(p logPane) string {
 		s += fmt.Sprintf(" →%d", p.hoff)
 	}
 	return wedgeStyle.Render(s)
+}
+
+// detailFooter is the blocks below the log panes: a blank, an optional confirm bar, an optional
+// status line, and the key-hint bar.
+func detailFooter(m model) []string {
+	f := []string{""}
+	if c := m.confirmBar(); c != "" {
+		f = append(f, c, "")
+	}
+	if m.status != "" {
+		f = append(f, m.statusStyle().Render(m.status), "")
+	}
+	return append(f, hintBar(hint{"f", "focus pane"}, hint{"↑↓←→", "scroll"}, hint{"G", "live"},
+		hint{"tab", "symbol"}, hint{"s", "start"}, hint{"x", "stop"}, hint{"r", "restart"}, hint{"K", "kill"}, hint{"esc", "back"}))
 }
 
 // detailStatusBody is the two-row key/value grid of the status panel (state lives in the box badge).
@@ -1321,8 +1356,11 @@ func tailFile(path string, limit int) ([]string, error) {
 	}
 	lines := make([]string, 0, len(raw))
 	for _, l := range raw {
+		// Sanitize to valid UTF-8: a runner's text log may hold bytes from a non-UTF-8 encoding (e.g.
+		// a cp1252 em-dash). Fed raw to the terminal they render at a different width than we measure,
+		// so the line wraps and the details frame grows past the screen, scrolling the chrome off.
 		if strings.TrimSpace(l) != "" {
-			lines = append(lines, l)
+			lines = append(lines, strings.ToValidUTF8(l, "�"))
 		}
 	}
 	if len(lines) > limit {

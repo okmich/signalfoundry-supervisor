@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
 	"github.com/okmich/signalfoundry-supervisor/internal/proc"
@@ -66,8 +67,16 @@ type sysConfig struct {
 // descriptive error (never panics) for any non-conforming input, and refuses if the resolved system
 // is currently running — an artefact must not be swapped under a live PID.
 func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
+	// Strip control/NUL runes first: a clipboard paste can interleave \x00 bytes (a mis-decoded UTF-16
+	// path), which would otherwise reach filepath.Abs below and fail with an opaque "invalid argument".
+	src := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, sourceDir)
 	// Tolerate Windows "Copy as path" quoting (it wraps the path in ") and stray whitespace.
-	src := strings.TrimSpace(strings.Trim(strings.TrimSpace(sourceDir), `"`))
+	src = strings.TrimSpace(strings.Trim(strings.TrimSpace(src), `"`))
 	if src == "" {
 		return Plan{}, fmt.Errorf("no source path given")
 	}

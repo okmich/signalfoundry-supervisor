@@ -1125,8 +1125,7 @@ func (m model) detailView() string {
 	// Size the two log panes to exactly what the chrome (title + status box + footer) leaves, so
 	// the frame never overflows the terminal and scrolls the chrome off-screen.
 	footer := detailFooter(m)
-	chrome := 2 + (len(statusBody) + 2) + len(footer) // title + blank + statusbox(+2 borders) + footer
-	innerH := max(m.rows()-chrome-2, 3)               // -2 = the panes' own top+bottom borders
+	innerH := m.detailPaneHeight() // single source of pane height; pgup/pgdown page by the same amount
 	leftW := (m.cols() - 4) / 2
 	rightW := m.cols() - 4 - leftW
 	leftLabel, rightLabel := boxTitleStyle.Render("z_system_log"), boxTitleStyle.Render("inference")
@@ -1271,8 +1270,11 @@ func hslice(s string, off int) string {
 
 // detailPaneHeight is the inner height of the log panes — the screen minus the title/status/hint
 // chrome, so the panes fill the lower ~⅔.
+// detailPaneHeight is the inner height of each detail log pane: the terminal minus the fixed chrome
+// (title + blank + 4-row status box + 2 pane borders = 8) and the variable footer (confirm/status/
+// hint). Drives both the pane sizing and pgup/pgdown paging, so the frame always fits the terminal.
 func (m model) detailPaneHeight() int {
-	return max(m.rows()-12, 3)
+	return max(m.rows()-len(detailFooter(m))-8, 3)
 }
 
 // shortToken trims a start token to a glanceable prefix.

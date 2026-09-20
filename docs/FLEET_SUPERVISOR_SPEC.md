@@ -178,12 +178,21 @@ individual system. One MT5 terminal = one broker login = one account: all system
 on it **share margin, share the magic-number namespace, and die together if the
 terminal crashes.**
 
-- **Cap: ≤ 10 *logical systems* per MT5 terminal / account.** The cap is about
-  blast radius and account sharing, not an arbitrary number. A `multi-trader`
-  trading 5 symbols counts as **5 logical systems** though it is **1 PID**.
-- The Supervisor tracks **two levels** and must not conflate them:
-  - **PID level** — the unit it can start / signal / kill.
-  - **System level** — the unit of blast radius and the ≤10 cap.
+- **Cap: ≤ 10 *logical systems* per MT5 terminal / account, where one logical
+  system is one OS process.** `mt5.initialize()` binds **one terminal IPC slot per
+  process**, whatever that process's symbol count, so a `multi-trader` trading 5
+  symbols is **1 logical system on 1 slot**, not 5. The cap rations the terminal's
+  connection slots and the blast radius of one crash, not an arbitrary number.
+- **Symbols are *legs*, and legs are not capped.** A terminal's leg count (Σ symbols
+  across its processes) is the **account-concentration** figure: shared margin and the
+  magic-number namespace scale with legs, not with slots. The fleet view **reports**
+  legs beside the cap and never refuses on them. Counting legs against the ≤10 was a
+  pre-`multi-trader` conflation — back then 1 system = 1 PID = 1 slot = 1 symbol, and
+  the four numbers were indistinguishable.
+- The Supervisor tracks **two numbers** and must not conflate them:
+  - **Logical systems (PIDs)** — the unit it can start / signal / kill, one terminal
+    IPC slot each; the unit of blast radius and the ≤10 cap.
+  - **Legs (symbols)** — the exposure/concentration unit; reported, never capped.
 - The fleet view must answer: *"if terminal X dies, which systems go dark?"* —
   i.e. it models `systems → terminal (broker session) → account`.
 
@@ -704,7 +713,8 @@ Remaining open items:
 | **Supervisor** | The per-box process control plane: discover / start / stop / restart / watch trading systems, with a local UI client. The subject of this spec. |
 | **Fleet Manager** | The future cross-box office layer that aggregates many Supervisors via outbound telemetry. |
 | **Trading system** | One deployed strategy instance run as one OS process; either a `trader` (one symbol) or a `multi-trader` (N symbols, one PID). |
-| **Logical system** | A unit of blast radius for the ≤10/terminal cap; a `multi-trader` is one PID but several logical systems. |
+| **Logical system** | One OS process = one broker connection = one MT5 terminal IPC slot (`mt5.initialize()` binds per-process); the unit of blast radius and of the ≤10/terminal cap. A `multi-trader` is **one** logical system carrying several **legs**. |
+| **Leg** | One symbol inside a logical system. A 4-symbol `multi-trader` is 1 logical system / 4 legs. Legs drive account concentration (shared margin, magic-number namespace), are reported per terminal, and are never capped ([§7](#7-terminal--account-topology-and-blast-radius)). |
 | **Control (stop)** | The Supervisor→system stop transport: a targeted `CTRL_C_EVENT` delivered to one child via AttachConsole ([§9](#9-control--targeted-console-ctrlc)), reusing the system's existing Ctrl+C graceful path. No in-system listener. |
 | **Bulk operation** | A whole-box `start-all` / `stop-all` / `restart-all` issued by the operator — a fan-out of single-system commands over the eligible subset, not a new transport; per-terminal / selected-set bulk is a deferred extension ([§11.1](#111-bulk-operations--start-all--stop-all--restart-all)). |
 | **Shutdown proof** | The `stopped` write to the runner **status file** (`status.json`) in `graceful_shutdown()`, proving a clean broker **connection** disconnect (`broker_disconnected: true`) — a status-file write, not a stream record (v1.1.0; LOGGING_CONTRACT §7.1/§7.4). Carries no position/exposure fields — exposure is a trade concern, invisible to the Supervisor ([§3](#3-principles), [§4](#4-organizational-boundary--ops-admin-vs-trade-analyst), [§10](#10-graceful-shutdown-contract-system-owned)). |

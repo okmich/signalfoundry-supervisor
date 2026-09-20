@@ -305,8 +305,11 @@ func TestGroupTerminals(t *testing.T) {
 	if len(terms) != 2 {
 		t.Fatalf("got %d terminals, want 2 (the stopped system has no session)", len(terms))
 	}
-	if got := byID["mt5-1"].LogicalSystems; got != 4 { // 1 single + a 3-symbol multi
-		t.Errorf("mt5-1 logical systems = %d, want 4 (a multi counts as len(symbols))", got)
+	if got := byID["mt5-1"].LogicalSystems; got != 2 { // 1 single + 1 multi = 2 PIDs = 2 terminal IPC slots
+		t.Errorf("mt5-1 logical systems = %d, want 2 (a multi-trader is ONE logical system, not len(symbols))", got)
+	}
+	if got := byID["mt5-1"].Legs; got != 4 { // 1 + a 3-symbol multi — concentration, reported but not capped
+		t.Errorf("mt5-1 legs = %d, want 4 (1 single + 3 multi symbols)", got)
 	}
 	if got := byID["mt5-2"].LogicalSystems; got != 1 {
 		t.Errorf("mt5-2 logical systems = %d, want 1", got)

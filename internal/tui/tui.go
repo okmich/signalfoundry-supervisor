@@ -28,7 +28,9 @@ const (
 	colAge    = 8
 )
 
-// terminalCap is the ≤10 logical-systems-per-broker-terminal blast-radius cap (§7).
+// terminalCap is the ≤10 logical-systems-per-broker-terminal blast-radius cap (§7). One logical
+// system = one PID = one MT5 terminal IPC slot; a multi-trader's symbols are legs, shown beside the
+// cap but never counted against it.
 const terminalCap = 10
 
 var (
@@ -543,8 +545,9 @@ func (m model) systemRow(s ipc.System, selected bool) string {
 	return row
 }
 
-// terminalHeader is the blast-radius subheader for a broker session (§7): account + the N/10 cap,
-// reddened when over cap. Non-running systems group under an "— not running —" header.
+// terminalHeader is the blast-radius subheader for a broker session (§7): account + the N/10 cap
+// (logical systems = PIDs = terminal IPC slots), reddened when over cap, plus the leg count when a
+// multi-trader makes legs ≠ systems. Non-running systems group under an "— not running —" header.
 func (m model) terminalHeader(session string, terms map[string]ipc.Terminal) string {
 	if session == "" {
 		return dimStyle.Render("— not running —")
@@ -560,6 +563,9 @@ func (m model) terminalHeader(session string, terms map[string]ipc.Terminal) str
 		capStyle = alertStyle
 	}
 	hdr := headerStyle.Render(fmt.Sprintf("terminal %s · %s · ", session, acct)) + capStyle.Render(capStr)
+	if t.Legs > t.LogicalSystems { // a multi-trader carries several symbols on its one slot: concentration, not cap
+		hdr += dimStyle.Render(fmt.Sprintf(" · %d legs", t.Legs))
+	}
 	if b := healthBadge(t.Health); b != "" { // broker-session precondition (§13)
 		hdr += dimStyle.Render(" · ") + b
 	}

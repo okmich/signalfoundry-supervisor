@@ -41,7 +41,8 @@ type Terminal struct {
 	Broker          string   `json:"broker,omitempty"`
 	Account         string   `json:"account_id"`
 	SystemIDs       []string `json:"system_ids"`
-	LogicalSystems  int      `json:"logical_systems"`  // the ≤10/terminal cap unit (a multi-trader counts as len(symbols))
+	LogicalSystems  int      `json:"logical_systems"`  // the ≤10/terminal cap unit: ONE PID = one logical system = one MT5 terminal IPC slot (mt5.initialize binds per-process), whatever its symbol count
+	Legs            int      `json:"legs"`             // symbols carried across those PIDs — account concentration (shared margin, magic-number namespace), NOT a cap
 	Health          string   `json:"health,omitempty"` // broker-session precondition health (green|red|unknown, §13)
 }
 

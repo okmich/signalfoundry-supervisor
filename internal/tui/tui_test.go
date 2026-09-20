@@ -241,6 +241,32 @@ func TestFleetViewShowsSessionHealth(t *testing.T) {
 	}
 }
 
+// A multi-trader holds ONE terminal IPC slot (mt5.initialize binds per-process), so it counts as one
+// logical system against the ≤10 cap (§7); its symbols surface as legs, reported but never capped.
+func TestFleetViewCountsMultiTraderAsOneSystem(t *testing.T) {
+	m := model{
+		cfg: config.Config{StateDir: t.TempDir()}, pending: map[string]pendingCmd{}, width: 100,
+		fleet: ipc.FleetState{
+			// the operator's case: 3 runners carrying 3 + 4 + 4 symbols on one account
+			Terminals: []ipc.Terminal{{BrokerSessionID: "mt5-deriv-1", Account: "DEMO-1", LogicalSystems: 3, Legs: 11}},
+			Systems: []ipc.System{
+				{SystemID: "a-multi", State: ipc.StateRunning, PID: 1, SessionID: "mt5-deriv-1", Account: "DEMO-1",
+					Multi: true, Symbols: []string{"s1", "s2", "s3"}},
+			},
+		},
+	}
+	out := m.fleetView()
+	if !strings.Contains(out, "3/10 systems") {
+		t.Errorf("3 runners on one terminal should read 3/10 systems\n%s", out)
+	}
+	if !strings.Contains(out, "11 legs") {
+		t.Errorf("the 11 symbols behind those 3 runners should report as legs\n%s", out)
+	}
+	if strings.Contains(out, "OVER CAP") {
+		t.Errorf("3 logical systems is well under the cap — 11 legs must not trip OVER CAP\n%s", out)
+	}
+}
+
 // A single stop must be confirmed: pressing x arms a confirm (no command), an errant key cancels it,
 // and only y actually submits.
 func TestConfirmGuardsSingleStop(t *testing.T) {

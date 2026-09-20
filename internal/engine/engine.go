@@ -684,8 +684,12 @@ func indexByID(systems []ipc.System) map[string]*ipc.System {
 
 // groupTerminals builds the blast-radius grouping (§7): running systems that share a broker session
 // die together. It orders `systems` in place by terminal (idle/non-running last) so the view can
-// render them grouped, and counts logical systems per terminal (the ≤10 cap unit — a multi-trader
-// is len(symbols) logical systems though one PID).
+// render them grouped, and counts the two per-terminal numbers that a single "logical systems"
+// count used to conflate:
+//   LogicalSystems — one per PID. mt5.initialize() binds one terminal IPC slot per PROCESS whatever
+//     its symbol count, so a 4-symbol multi-trader is ONE logical system. This is the ≤10 cap unit.
+//   Legs — one per symbol. The account-concentration figure (shared margin, magic-number namespace);
+//     reported for the operator, never capped — it is not a terminal resource.
 func groupTerminals(systems []ipc.System) []ipc.Terminal {
 	sort.SliceStable(systems, func(i, j int) bool {
 		if ki, kj := groupKey(systems[i]), groupKey(systems[j]); ki != kj {
@@ -707,11 +711,12 @@ func groupTerminals(systems []ipc.System) []ipc.Terminal {
 			order = append(order, s.SessionID)
 		}
 		t.SystemIDs = append(t.SystemIDs, s.SystemID)
-		n := 1
-		if s.Multi {
-			n = len(s.Symbols)
+		t.LogicalSystems++ // one process, one IPC slot — a multi-trader is ONE logical system, not N
+		legs := 1
+		if n := len(s.Symbols); s.Multi && n > 0 {
+			legs = n
 		}
-		t.LogicalSystems += n
+		t.Legs += legs
 	}
 	out := make([]ipc.Terminal, 0, len(order))
 	for _, id := range order {

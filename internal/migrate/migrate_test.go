@@ -166,3 +166,64 @@ func TestEnvDefaultBeatsMentions(t *testing.T) {
 		t.Fatalf("envDefaults(_ENV_FILE) = %v", got)
 	}
 }
+
+// A re-run after an interrupted apply (live folders moved, logs not) still places the log folders and the
+// root-level state files by where their systems already are.
+func TestResumesAfterPartialApply(t *testing.T) {
+	cfg := flatBox(t)
+	for _, n := range []string{"ctlpb_raw-multi", "propfolio_trend-multi"} {
+		acct := map[string]string{"ctlpb_raw-multi": "fxify.demo", "propfolio_trend-multi": "icmarkets.demo"}[n]
+		if err := os.MkdirAll(filepath.Join(cfg.LiveBase, acct), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(filepath.Join(cfg.LiveBase, n), filepath.Join(cfg.LiveBase, acct, n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p, err := BuildPlan(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Mapping["ctlpb_raw-multi"] != "fxify.demo" || p.Sources["ctlpb_raw-multi"] != "already migrated" {
+		t.Fatalf("mapping = %v / %v", p.Mapping, p.Sources)
+	}
+	want := map[string]bool{
+		filepath.Join(cfg.LogBase, "fxify.demo", "ctlpb_raw-multi"):                                           false,
+		filepath.Join(cfg.LogBase, "icmarkets.demo", "propfolio_trend-multi"):                                 false,
+		filepath.Join(cfg.LogBase, "fxify.demo", "ctlpb_raw-multi", "ctlpb_levels_EURUSD.r_20260827101.json"): false,
+	}
+	for _, m := range p.Moves {
+		if _, ok := want[m.To]; ok {
+			want[m.To] = true
+		}
+	}
+	for to, seen := range want {
+		if !seen {
+			t.Errorf("resume should plan a move to %s; moves = %+v", to, p.Moves)
+		}
+	}
+}
+
+// Apply proves every move first: a source that cannot be renamed (Windows: a file inside is open) aborts
+// before anything moves.
+func TestApplyMovesNothingWhenOneSourceIsLocked(t *testing.T) {
+	cfg := flatBox(t)
+	p, err := BuildPlan(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(filepath.Join(cfg.LogBase, "propfolio_trend-multi", "z_system_log_1.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := probeRename(filepath.Join(cfg.LogBase, "propfolio_trend-multi")); err == nil {
+		t.Skip("this platform renames a folder with an open file inside; nothing to prove")
+	}
+	if err := p.Apply(cfg); err == nil || !strings.Contains(err.Error(), "nothing was moved") {
+		t.Fatalf("want a refusal, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.LiveBase, "ctlpb_raw-multi", "run.py")); err != nil {
+		t.Errorf("the first live move must not have happened: %v", err)
+	}
+}

@@ -88,14 +88,19 @@ func BuildPlan(cfg config.Config, overrides map[string]string) (Plan, error) {
 		}
 	}
 	// Everything not placed yet (log folders and archives of systems no longer live, or a live folder with
-	// no run.py): an override, else the archived run.py. A live folder whose run.py was ambiguous stays
-	// unplaced rather than trusting an older archive.
+	// no run.py): an override, else where an earlier (interrupted) run already put that name, else the
+	// archived run.py. A live folder whose run.py was ambiguous stays unplaced rather than trusting those.
+	migrated := migratedNames(cfg.LiveBase)
 	for _, name := range append(append(append([]string{}, liveNames...), logNames...), archNames...) {
 		if _, done := p.Mapping[name]; done || p.Sources[name] != "" {
 			continue
 		}
 		if acct, ok := overrides[name]; ok {
 			p.Mapping[name], p.Sources[name] = acct, "--map"
+			continue
+		}
+		if acct, ok := migrated[name]; ok {
+			p.Mapping[name], p.Sources[name] = acct, "already migrated"
 			continue
 		}
 		if found := envDefaults(filepath.Join(cfg.LiveBase, archiveDir, name)); len(found) == 1 {
@@ -179,6 +184,14 @@ func (p Plan) Apply(cfg config.Config) error {
 	if again.checkNothingRuns(cfg); len(again.Blockers) > 0 {
 		return fmt.Errorf("refusing: %s", again.Blockers[0])
 	}
+	// Prove every move can happen before making the first one. On Windows a folder cannot be renamed while a
+	// file inside it is open (a tailed log, an editor), and failing halfway would leave the box split between
+	// layouts. Each source is renamed aside and straight back; nothing stays moved if any probe fails.
+	for _, m := range p.Moves {
+		if err := probeRename(m.From); err != nil {
+			return fmt.Errorf("refusing, nothing was moved: %w — close whatever holds it open and re-run", err)
+		}
+	}
 	for _, m := range p.Moves {
 		if err := os.MkdirAll(filepath.Dir(m.To), 0o755); err != nil {
 			return err
@@ -233,8 +246,9 @@ func (p *Plan) checkNothingRuns(cfg config.Config) {
 			}
 		}
 	}
-	matches, _ := filepath.Glob(filepath.Join(cfg.LogBase, "*", "status.json"))
-	for _, path := range matches {
+	flat, _ := filepath.Glob(filepath.Join(cfg.LogBase, "*", "status.json"))
+	underAccount, _ := filepath.Glob(filepath.Join(cfg.LogBase, "*", "*", "status.json")) // already migrated
+	for _, path := range append(flat, underAccount...) {
 		if rs, err := contract.ReadStatus(path); err == nil && rs.State == "running" && rs.PID != 0 && proc.Alive(rs.PID) {
 			p.Blockers = append(p.Blockers, fmt.Sprintf("%s reports running (pid %d) — stop the fleet first", path, rs.PID))
 		}
@@ -290,11 +304,52 @@ func envDefaults(dir string) []string {
 	return out
 }
 
-// magicOwners maps each magic number in a mapped live system's config.json to <account>/<runner root>.
+// migratedNames maps each folder already under an account — in LIVE_BASE/<account>/ or
+// LIVE_BASE/.archive/<account>/ — to that account, so a re-run after an interrupted apply still places the
+// log folders and root files of the systems it had already moved.
+func migratedNames(liveBase string) map[string]string {
+	out := map[string]string{}
+	for _, base := range []string{liveBase, filepath.Join(liveBase, archiveDir)} {
+		accts, _ := os.ReadDir(base)
+		for _, a := range accts {
+			if !a.IsDir() || !accounts.Valid(a.Name()) {
+				continue
+			}
+			names, _ := os.ReadDir(filepath.Join(base, a.Name()))
+			for _, n := range names {
+				if n.IsDir() && !strings.HasPrefix(n.Name(), ".") {
+					if _, seen := out[n.Name()]; !seen {
+						out[n.Name()] = a.Name()
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// probeRename checks that path can be renamed right now by renaming it aside and straight back.
+func probeRename(path string) error {
+	aside := path + ".migrate-probe"
+	if err := os.Rename(path, aside); err != nil {
+		return fmt.Errorf("%s cannot be moved: %w", path, err)
+	}
+	if err := os.Rename(aside, path); err != nil {
+		return fmt.Errorf("probe left %s at %s — rename it back by hand: %w", path, aside, err)
+	}
+	return nil
+}
+
+// magicOwners maps each magic number in a mapped live system's config.json to <account>/<runner root>. The
+// system is read where it is: still flat, or already under its account.
 func magicOwners(liveBase string, mapping map[string]string) map[string]string {
 	out := map[string]string{}
 	for name, acct := range mapping {
-		_ = filepath.WalkDir(filepath.Join(liveBase, name), func(path string, d fs.DirEntry, err error) error {
+		dir := filepath.Join(liveBase, name)
+		if _, err := os.Stat(dir); err != nil {
+			dir = filepath.Join(liveBase, acct, name)
+		}
+		_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil || d.IsDir() || d.Name() != "config.json" {
 				return nil //nolint:nilerr
 			}

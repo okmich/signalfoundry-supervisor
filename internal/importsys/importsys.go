@@ -22,6 +22,7 @@ import (
 
 	"github.com/okmich/signalfoundry-supervisor/internal/accounts"
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
+	"github.com/okmich/signalfoundry-supervisor/internal/discovery"
 	"github.com/okmich/signalfoundry-supervisor/internal/proc"
 	"github.com/okmich/signalfoundry-supervisor/internal/registry"
 )
@@ -211,33 +212,37 @@ func (p Plan) Apply(cfg config.Config) (archivedTo string, err error) {
 
 // Decommission retires an installed system: it archives the system's LIVE_BASE artefact dir to
 // .archive (the inverse of an import) so discovery drops it from the fleet, and is reversible. It
-// refuses if the system is running. Returns the archive location. The system_id is the relative path
-// under LIVE_BASE for both a single-trader (<account>/<strategy>/<symbol>/<timeframe>) and a multi-trader
-// (<account>/<strategy>-multi), so it maps straight to the artefact dir. An id that names a whole account
-// folder, or anything outside one, is refused.
+// refuses if the system is running. Returns the archive location.
+//
+// The id must be one discovery currently reports, and the folder archived is that system's own artefact
+// dir. An id is never turned into a path by itself, so a crafted or stale id ("fxify.demo/../deriv.live",
+// "fxify.demo/.", a strategy folder holding several systems) can never archive an account, another
+// account's systems, or anything outside one system.
 func Decommission(cfg config.Config, systemID string) (archivedTo string, err error) {
 	if strings.TrimSpace(systemID) == "" {
 		return "", fmt.Errorf("no system id given")
 	}
-	if acct, rest, ok := strings.Cut(systemID, "/"); !ok || !accounts.Valid(acct) || strings.TrimSpace(rest) == "" {
-		return "", fmt.Errorf("invalid system id %q (expected <account>/<system>)", systemID)
+	cat, _, err := discovery.Scan(cfg.LiveBase)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("scan LIVE_BASE: %w", err)
+	}
+	var target string
+	for _, s := range cat {
+		if s.SystemID == systemID {
+			target = s.Dir
+			break
+		}
+	}
+	if target == "" {
+		return "", fmt.Errorf("system %q not found in LIVE_BASE", systemID)
 	}
 	if err := ensureNotRunning(cfg, systemID); err != nil {
 		return "", err
 	}
-	rel := filepath.FromSlash(systemID)
-	target := filepath.Join(cfg.LiveBase, rel)
-	// Containment: an exported rename must never escape LIVE_BASE or hit LIVE_BASE itself, even if a
-	// bogus id (".", "..", "../x") slips in — a system_id="." would otherwise archive the whole tree.
-	if liveAbs, aerr := filepath.Abs(cfg.LiveBase); aerr == nil {
-		if tAbs, terr := filepath.Abs(target); terr != nil {
-			return "", terr
-		} else if r, rerr := filepath.Rel(liveAbs, tAbs); rerr != nil || r == "." || strings.HasPrefix(r, "..") {
-			return "", fmt.Errorf("invalid system id %q (resolves outside LIVE_BASE)", systemID)
-		}
-	}
-	if info, statErr := os.Stat(target); statErr != nil || !info.IsDir() {
-		return "", fmt.Errorf("system %q not found in LIVE_BASE (%s)", systemID, target)
+	// Defense in depth: the artefact dir sits inside an account folder, below LIVE_BASE.
+	rel, err := filepath.Rel(cfg.LiveBase, target)
+	if acct, rest, _ := strings.Cut(filepath.ToSlash(rel), "/"); err != nil || !accounts.Valid(acct) || rest == "" {
+		return "", fmt.Errorf("system %q resolves outside an account folder (%s)", systemID, target)
 	}
 	ts := time.Now().UTC().Format("20060102T150405Z")
 	archivedTo = filepath.Join(cfg.LiveBase, ArchiveDir, rel, ts)

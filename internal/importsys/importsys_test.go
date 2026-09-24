@@ -289,3 +289,37 @@ func TestBuildPlanRequiresAnAccountWithAnEnvFile(t *testing.T) {
 		t.Fatalf("want missing-env error, got %v", err)
 	}
 }
+
+// Decommission acts only on a system discovery reports: ids that would resolve to a whole account, another
+// account, or a strategy folder holding several systems are refused and nothing moves.
+func TestDecommissionOnlyDiscoveredSystems(t *testing.T) {
+	cfg := testCfg(t)
+	writeFile(t, filepath.Join(cfg.EnvDir, ".env.deriv.live"), "LOGIN_ID=2\n")
+	for _, a := range []string{acct, "deriv.live"} {
+		for _, sym := range []string{"EURUSD", "GBPUSD"} {
+			src := srcWith(t, `{"strategy":{"name":"s","symbol":"`+sym+`","timeframe":15},"strategies":[]}`)
+			p, err := BuildPlan(cfg, a, src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := p.Apply(cfg); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, id := range []string{acct + "/../deriv.live", acct + "/.", acct + "/./s/EURUSD/15", acct + "/s", acct + "/.archive/..", "deriv.live/s/EURUSD"} {
+		if _, err := Decommission(cfg, id); err == nil {
+			t.Errorf("id %q should be refused", id)
+		}
+	}
+	for _, a := range []string{acct, "deriv.live"} {
+		for _, sym := range []string{"EURUSD", "GBPUSD"} {
+			if _, err := os.Stat(filepath.Join(cfg.LiveBase, a, "s", sym, "15", "run.py")); err != nil {
+				t.Errorf("%s/%s must be untouched: %v", a, sym, err)
+			}
+		}
+	}
+	if _, err := Decommission(cfg, "deriv.live/s/GBPUSD/15"); err != nil {
+		t.Fatalf("a discovered id should decommission: %v", err)
+	}
+}

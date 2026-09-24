@@ -374,3 +374,16 @@ func TestSettingsNormalized(t *testing.T) {
 		t.Errorf("Normalized clobbered valid values: %+v", keep)
 	}
 }
+
+// A start is refused, naming the keys, when the account's env file lacks what its runners need.
+func TestStartGatedOnSessionKeys(t *testing.T) {
+	e := testEngine(t)
+	if err := os.WriteFile(filepath.Join(e.cfg.EnvDir, ".env.fxify.demo"), []byte("LOGIN_ID=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &ipc.System{SystemID: "fxify.demo/x/Y/5", Account: "fxify.demo", State: ipc.StateStopped}
+	res := e.doStart(ipc.Command{ID: "c1", SystemID: s.SystemID}, s, discovery.System{Account: "fxify.demo", RunPy: "run.py"})
+	if res.Accepted || !strings.Contains(res.Error, "lacks TERMINAL_PATH, LOGIN_SERVER") {
+		t.Errorf("want a missing-keys refusal, got accepted=%v err=%q", res.Accepted, res.Error)
+	}
+}

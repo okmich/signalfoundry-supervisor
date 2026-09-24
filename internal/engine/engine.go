@@ -678,11 +678,15 @@ func (e *engine) launch(account, runPy string) (int, error) {
 	return proc.Spawn(e.cfg.Python, runPy, []string{accounts.EnvVar + "=" + account})
 }
 
-// accountGate refuses a start/restart whose account has no broker env file: the runner would fail at
-// startup anyway, and the refusal names the missing file.
+// accountGate refuses a start/restart whose account has no broker env file, or one without the session
+// keys its runners need: the runner would fail at startup anyway, and the refusal names what is missing.
 func (e *engine) accountGate(d discovery.System) (string, bool) {
-	if info := accounts.Load(e.cfg.EnvDir, d.Account); !info.EnvFound {
+	info := accounts.Load(e.cfg.EnvDir, d.Account)
+	if !info.EnvFound {
 		return fmt.Sprintf("no broker env file for account %s (%s) — refusing start", d.Account, info.EnvFile), false
+	}
+	if missing := info.MissingSessionKeys(); len(missing) > 0 {
+		return fmt.Sprintf("%s lacks %s — refusing start", info.EnvFile, strings.Join(missing, ", ")), false
 	}
 	return "", true
 }
@@ -757,7 +761,8 @@ func groupAccounts(systems []ipc.System, envs *accounts.Cache) []ipc.Account {
 		s := &systems[i]
 		if len(out) == 0 || out[len(out)-1].Name != s.Account {
 			info := envs.Get(s.Account)
-			out = append(out, ipc.Account{Name: s.Account, Login: info.Login, Server: info.Server, EnvMissing: !info.EnvFound})
+			out = append(out, ipc.Account{Name: s.Account, Login: info.Login, Server: info.Server, EnvMissing: !info.EnvFound,
+				EnvMissingKeys: info.MissingSessionKeys()})
 		}
 		a := &out[len(out)-1]
 		a.SystemIDs = append(a.SystemIDs, s.SystemID)

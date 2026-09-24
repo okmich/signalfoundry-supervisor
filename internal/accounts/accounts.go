@@ -3,8 +3,8 @@
 // the first level under both LIVE_BASE and LOG_BASE (ACCOUNT_LAYOUT_CHANGE_PLAN, LOGGING_CONTRACT §10).
 //
 // The env files hold credentials. This package reads ONLY the identity keys the supervisor needs to
-// label and check an account (LOGIN_ID, LOGIN_SERVER, BROKER_NAME, TERMINAL_PATH) and never retains or
-// exposes anything else.
+// label and check an account (LOGIN_ID, LOGIN_SERVER, BROKER_NAME, TERMINAL_PATH, IB_HOST) and never
+// retains or exposes anything else.
 package accounts
 
 import (
@@ -45,6 +45,24 @@ type Info struct {
 	Server       string // LOGIN_SERVER
 	Broker       string // BROKER_NAME
 	TerminalPath string // TERMINAL_PATH
+	IBHost       string // IB_HOST: marks an IB account (gateway session, no terminal or login in the file)
+}
+
+// MissingSessionKeys lists the keys the account's env file must carry for its runners to reach their broker
+// session but does not: TERMINAL_PATH, LOGIN_ID and LOGIN_SERVER for an MT5 account; nothing beyond IB_HOST
+// for an IB account. The engine refuses a start while any is missing (FLEET_SUPERVISOR_SPEC §13), so the
+// operator sees which key is absent instead of a runner crashing on its first line.
+func (i Info) MissingSessionKeys() []string {
+	if !i.EnvFound || i.IBHost != "" {
+		return nil
+	}
+	var out []string
+	for _, kv := range [][2]string{{"TERMINAL_PATH", i.TerminalPath}, {"LOGIN_ID", i.Login}, {"LOGIN_SERVER", i.Server}} {
+		if kv[1] == "" {
+			out = append(out, kv[0])
+		}
+	}
+	return out
 }
 
 // EnvPath is <envDir>/.env.<name>.
@@ -76,6 +94,8 @@ func Load(envDir, name string) Info {
 			info.Broker = val
 		case "TERMINAL_PATH":
 			info.TerminalPath = val
+		case "IB_HOST":
+			info.IBHost = val
 		}
 	}
 	return info

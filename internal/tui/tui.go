@@ -128,6 +128,8 @@ type confirmState struct {
 	bulk     bool   // whole-box fan-out vs a single system
 	systemID string // single target (empty for bulk / quit)
 	count    int    // bulk target count (for the prompt)
+	account  string // bulk only: the selected system's account, offered as the narrower scope ([a])
+	acctN    int    // bulk only: eligible targets in that account (0 -> the [a] scope is not offered)
 }
 
 type pendingCmd struct {
@@ -280,7 +282,12 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) handleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	c := m.confirm
 	m.confirm = nil
-	if s := k.String(); s != "y" && s != "Y" {
+	s := k.String()
+	if c.bulk && c.acctN > 0 && (s == "a" || s == "A") { // the narrower scope: only the selected account
+		m.submitBulk(c.action, c.account)
+		return m, nil
+	}
+	if s != "y" && s != "Y" {
 		m.status = "cancelled"
 		return m, nil
 	}
@@ -295,7 +302,7 @@ func (m model) handleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "start", "stop", "restart", "kill":
 		if c.bulk {
-			m.submitBulk(c.action)
+			m.submitBulk(c.action, "")
 		} else {
 			m.submitByID(c.action, c.systemID)
 		}
@@ -529,6 +536,10 @@ func (m model) confirmBar() string {
 		what = fmt.Sprintf("KILL %s (force — skips graceful shutdown)", c.systemID)
 	case c.bulk:
 		what = fmt.Sprintf("%s ALL %d system(s)", strings.ToUpper(c.action), c.count)
+		if c.acctN > 0 {
+			return alertStyle.Render(what+"?") + dimStyle.Render(fmt.Sprintf("   [y] all %d   ·   [a] %s only (%d)   ·   any other key cancels",
+				c.count, c.account, c.acctN))
+		}
 	default:
 		what = fmt.Sprintf("%s %s", strings.ToUpper(c.action), c.systemID)
 	}
@@ -593,8 +604,11 @@ func accountHeader(a ipc.Account, name string) string {
 	if b := healthBadge(a.Health); b != "" { // broker-session precondition (§13)
 		hdr += dimStyle.Render(" · ") + b
 	}
-	if a.EnvMissing {
+	switch {
+	case a.EnvMissing:
 		hdr += dimStyle.Render(" · ") + alertStyle.Render("no .env."+name+" — cannot start")
+	case len(a.EnvMissingKeys) > 0:
+		hdr += dimStyle.Render(" · ") + alertStyle.Render(".env lacks "+strings.Join(a.EnvMissingKeys, ", ")+" — cannot start")
 	}
 	return hdr
 }
@@ -767,11 +781,16 @@ func (m *model) reconcileAwaiting() {
 }
 
 // submitBulk fans out one single-system command per eligible target (§11.1: bulk is a fan-out, not
-// a new command shape). Eligibility: start-all -> Stopped; stop-all / restart-all -> Running.
-func (m *model) submitBulk(action string) {
-	targets := m.bulkTargets(action)
+// a new command shape). Eligibility: start-all -> Stopped; stop-all / restart-all -> Running. A non-empty
+// account narrows the fan-out to that account's systems.
+func (m *model) submitBulk(action, account string) {
+	targets := m.bulkTargets(action, account)
+	scope := action + "-all"
+	if account != "" {
+		scope = action + " " + account
+	}
 	if len(targets) == 0 {
-		m.status = "nothing eligible for " + action + "-all"
+		m.status = "nothing eligible for " + scope
 		return
 	}
 	n := 0
@@ -781,21 +800,32 @@ func (m *model) submitBulk(action string) {
 			n++
 		}
 	}
-	m.status = fmt.Sprintf("submitted %s-all to %d system(s)", action, n)
+	m.status = fmt.Sprintf("submitted %s to %d system(s)", scope, n)
 }
 
+// armBulkConfirm arms the confirm for a whole-box action and offers the selected system's account as the
+// narrower scope (one broker down: stop that account, keep the others).
 func (m *model) armBulkConfirm(action string) {
-	if n := len(m.bulkTargets(action)); n > 0 {
-		m.confirm = &confirmState{action: action, bulk: true, count: n}
-	} else {
+	n := len(m.bulkTargets(action, ""))
+	if n == 0 {
 		m.status = "nothing eligible for " + action + "-all"
+		return
 	}
+	c := &confirmState{action: action, bulk: true, count: n}
+	if m.cursor >= 0 && m.cursor < len(m.fleet.Systems) {
+		c.account = m.fleet.Systems[m.cursor].Account
+		c.acctN = len(m.bulkTargets(action, c.account))
+	}
+	m.confirm = c
 }
 
-// bulkTargets returns the system_ids eligible for a whole-box action (§11.1).
-func (m *model) bulkTargets(action string) []string {
+// bulkTargets returns the system_ids eligible for a bulk action (§11.1): the whole box, or one account.
+func (m *model) bulkTargets(action, account string) []string {
 	var ids []string
 	for _, s := range m.fleet.Systems {
+		if account != "" && s.Account != account {
+			continue
+		}
 		switch action {
 		case "start":
 			if s.State == ipc.StateStopped {

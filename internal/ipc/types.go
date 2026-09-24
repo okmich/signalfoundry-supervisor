@@ -50,6 +50,7 @@ type Account struct {
 	Login           string   `json:"login,omitempty"`             // LOGIN_ID from .env.<account>
 	Server          string   `json:"server,omitempty"`            // LOGIN_SERVER from .env.<account>
 	EnvMissing      bool     `json:"env_missing,omitempty"`       // no .env.<account> in ENV_DIR: its systems cannot start
+	EnvMissingKeys  []string `json:"env_missing_keys,omitempty"`  // session keys .env.<account> lacks: its systems cannot start
 	BrokerSessionID string   `json:"broker_session_id,omitempty"` // from a running system's status.json
 	Broker          string   `json:"broker,omitempty"`            // status.json broker (for the session probe)
 	SystemIDs       []string `json:"system_ids"`

@@ -23,7 +23,7 @@ func box(t *testing.T) (cfg config.Config, live, logb string) {
 	if err := os.MkdirAll(cfg.EnvDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(cfg.EnvDir, ".env."+acct), []byte("LOGIN_ID=42\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cfg.EnvDir, ".env."+acct), []byte("LOGIN_ID=42\nLOGIN_SERVER=Demo\nTERMINAL_PATH=C:\\mt5\\terminal64.exe\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return cfg, filepath.Join(cfg.LiveBase, acct), filepath.Join(cfg.LogBase, acct)
@@ -244,5 +244,21 @@ func TestReconcileRunnerFolder(t *testing.T) {
 	s := systems[0]
 	if s.SystemID != "fxify.demo/_account_admin" || s.State != ipc.StateRunning || len(s.Legs) != 1 || s.Legs[0].Timeframe != "1" || s.LastBarTS.IsZero() {
 		t.Fatalf("admin row = %+v", s)
+	}
+}
+
+// An account whose env file lacks a session key is a problem: its systems cannot start.
+func TestReconcileReportsIncompleteEnv(t *testing.T) {
+	cfg, live, _ := box(t)
+	if err := os.WriteFile(filepath.Join(cfg.EnvDir, ".env."+acct), []byte("LOGIN_ID=42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(live, "s", "X", "5"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(live, "s", "X", "5", "run.py"), nil, 0o644)
+	_, problems := Reconcile(cfg)
+	if len(problems) != 1 || !strings.Contains(problems[0].Reason, "lacks TERMINAL_PATH, LOGIN_SERVER") {
+		t.Fatalf("problems = %+v", problems)
 	}
 }

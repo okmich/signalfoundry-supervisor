@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/accounts"
@@ -44,10 +45,15 @@ func Reconcile(cfg config.Config) ([]ipc.System, []ipc.Problem) {
 	systems := make([]ipc.System, 0, len(cat))
 	for _, c := range cat {
 		env := envs.Get(c.Account)
-		if !env.EnvFound && !missing[c.Account] {
-			missing[c.Account] = true
-			problems = append(problems, ipc.Problem{Path: c.Account,
-				Reason: fmt.Sprintf("no broker env file %s — its systems cannot start", env.EnvFile)})
+		if !missing[c.Account] {
+			if keys := env.MissingSessionKeys(); !env.EnvFound || len(keys) > 0 {
+				missing[c.Account] = true
+				reason := fmt.Sprintf("no broker env file %s — its systems cannot start", env.EnvFile)
+				if env.EnvFound {
+					reason = fmt.Sprintf("%s lacks %s — its systems cannot start", env.EnvFile, strings.Join(keys, ", "))
+				}
+				problems = append(problems, ipc.Problem{Path: c.Account, Reason: reason})
+			}
 		}
 		statusPath := contract.StatusPath(cfg.LogBase, c.Account, c.RunnerStrategy)
 		s := ipc.System{

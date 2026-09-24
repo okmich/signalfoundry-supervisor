@@ -49,3 +49,18 @@ func TestList(t *testing.T) {
 		t.Fatalf("List = %v, want %v", got, want)
 	}
 }
+
+func TestMissingSessionKeys(t *testing.T) {
+	if got := (Info{EnvFound: true, Login: "1"}).MissingSessionKeys(); !reflect.DeepEqual(got, []string{"TERMINAL_PATH", "LOGIN_SERVER"}) {
+		t.Errorf("MT5 missing = %v", got)
+	}
+	if got := (Info{EnvFound: true, Login: "1", Server: "S", TerminalPath: "T"}).MissingSessionKeys(); got != nil {
+		t.Errorf("complete MT5 = %v", got)
+	}
+	if got := (Info{EnvFound: true, IBHost: "127.0.0.1"}).MissingSessionKeys(); got != nil {
+		t.Errorf("IB needs no MT5 keys, got %v", got)
+	}
+	if got := (Info{}).MissingSessionKeys(); got != nil {
+		t.Errorf("a missing file is reported as missing, not as missing keys: %v", got)
+	}
+}

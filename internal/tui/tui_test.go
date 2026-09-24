@@ -624,13 +624,13 @@ func TestStartStatusGraceBeforeActive(t *testing.T) {
 
 func TestBulkTargets(t *testing.T) {
 	m := testModel(t)
-	if got := m.bulkTargets("stop"); len(got) != 2 {
+	if got := m.bulkTargets("stop", ""); len(got) != 2 {
 		t.Errorf("stop targets = %v, want the 2 Running systems", got)
 	}
-	if got := m.bulkTargets("restart"); len(got) != 2 {
+	if got := m.bulkTargets("restart", ""); len(got) != 2 {
 		t.Errorf("restart targets = %v, want the 2 Running systems", got)
 	}
-	got := m.bulkTargets("start")
+	got := m.bulkTargets("start", "")
 	if len(got) != 1 || got[0] != "b/Y/M5" {
 		t.Errorf("start targets = %v, want only the Stopped system [b/Y/M5] (not StoppedByOperator)", got)
 	}
@@ -638,7 +638,7 @@ func TestBulkTargets(t *testing.T) {
 
 func TestSubmitBulkStopFansOut(t *testing.T) {
 	m := testModel(t)
-	m.submitBulk("stop")
+	m.submitBulk("stop", "")
 	cmds, err := ipc.PendingCommands(m.cfg.CommandsDir())
 	if err != nil {
 		t.Fatal(err)
@@ -816,5 +816,37 @@ func TestDecommissionRefusedForAdmin(t *testing.T) {
 	mm := armed.(model)
 	if mm.confirm != nil || !strings.Contains(mm.status, "governance") {
 		t.Fatalf("want a refusal without a confirm, got confirm=%+v status=%q", mm.confirm, mm.status)
+	}
+}
+
+// S/X/R arm one confirm that offers the whole box ([y]) or only the selected system's account ([a]).
+func TestBulkConfirmOffersTheSelectedAccount(t *testing.T) {
+	m := testModel(t)
+	m.fleet.Systems = []ipc.System{
+		{SystemID: "fxify.demo/a", Account: "fxify.demo", State: ipc.StateRunning, PID: 1},
+		{SystemID: "fxify.demo/b", Account: "fxify.demo", State: ipc.StateRunning, PID: 2},
+		{SystemID: "icmarkets.demo/c", Account: "icmarkets.demo", State: ipc.StateRunning, PID: 3},
+	}
+	m.cursor = 2 // icmarkets.demo/c
+	armed, _ := m.handleKey(key("X"))
+	mm := armed.(model)
+	if mm.confirm == nil || mm.confirm.count != 3 || mm.confirm.account != "icmarkets.demo" || mm.confirm.acctN != 1 {
+		t.Fatalf("confirm = %+v", mm.confirm)
+	}
+	if bar := mm.confirmBar(); !strings.Contains(bar, "[a] icmarkets.demo only (1)") {
+		t.Errorf("confirm bar should offer the account scope: %q", bar)
+	}
+	done, _ := mm.handleKey(key("a"))
+	dm := done.(model)
+	if len(dm.pending) != 1 {
+		t.Fatalf("[a] should submit only the account's system, pending = %+v", dm.pending)
+	}
+	for _, pc := range dm.pending {
+		if pc.systemID != "icmarkets.demo/c" || pc.action != "stop" {
+			t.Errorf("submitted %+v", pc)
+		}
+	}
+	if !strings.Contains(dm.status, "stop icmarkets.demo") {
+		t.Errorf("status = %q", dm.status)
 	}
 }

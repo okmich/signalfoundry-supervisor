@@ -705,6 +705,10 @@ func (m *model) armDecommissionConfirm(systemID string) {
 		m.status = "stop " + systemID + " before decommissioning"
 		return
 	}
+	if strings.HasSuffix(systemID, "/"+accounts.AdminFolder) {
+		m.status = systemID + " is the Account Admin: governance is removed by runbook (ACCOUNT_ADMIN_SPEC §8.3), not by decommission"
+		return
+	}
 	m.confirm = &confirmState{action: "decommission", systemID: systemID}
 }
 
@@ -949,8 +953,11 @@ func (m model) importView() string {
 	} else { // confirm phase
 		p := im.plan
 		kind := "single-trader"
-		if p.Multi {
+		switch {
+		case p.Multi:
 			kind = fmt.Sprintf("multi-trader · %d symbols", len(p.Symbols))
+		case p.Runner:
+			kind = "runner"
 		}
 		field := func(label, val string) string {
 			return "  " + dimStyle.Width(11).Render(label) + selStyle.Render(truncate(val, innerW-14))
@@ -969,6 +976,9 @@ func (m model) importView() string {
 		}
 		if p.WillArchive {
 			body = append(body, "", alertStyle.Render("⚠ a copy already exists at the target — it is archived first"))
+		}
+		if p.Runner && p.Strategy == accounts.AdminFolder {
+			body = append(body, dimStyle.Render("Account Admin: the installed directive, state and requests are kept; none are taken from the source"))
 		}
 	}
 	box := titledBox(boxTitleStyle.Render("import system"), dimStyle.Render("provision into LIVE_BASE · §16"), innerW, len(body), body)

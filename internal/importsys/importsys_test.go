@@ -323,3 +323,81 @@ func TestDecommissionOnlyDiscoveredSystems(t *testing.T) {
 		t.Fatalf("a discovered id should decommission: %v", err)
 	}
 }
+
+// A runner artefact (config.json `runner`) installs directly under the account folder.
+func TestBuildPlanRunner(t *testing.T) {
+	cfg := testCfg(t)
+	src := srcWith(t, `{"runner":"_account_admin","cycle_s":20}`)
+	p, err := BuildPlan(cfg, acct, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Runner || p.SystemID != "fxify.demo/_account_admin" || p.TargetDir != filepath.Join(cfg.LiveBase, acct, "_account_admin") {
+		t.Fatalf("plan = %+v", p)
+	}
+}
+
+// Re-importing the Account Admin keeps the account governed: the installed directive, state and request
+// inbox travel into the new copy, and whatever governance files the source carried are dropped.
+func TestAdminImportCarriesGovernance(t *testing.T) {
+	cfg := testCfg(t)
+	admin := filepath.Join(cfg.LiveBase, acct, "_account_admin")
+	first := srcWith(t, `{"runner":"_account_admin","v":1}`)
+	p, err := BuildPlan(cfg, acct, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	// The running Admin wrote its governance files.
+	writeFile(t, filepath.Join(admin, "directive.json"), `{"directive":"NO_OPS","sequence":7}`)
+	writeFile(t, filepath.Join(admin, "state.json"), `{"latches":{"daily":true}}`)
+	writeFile(t, filepath.Join(admin, "requests", "done", "r1.json"), `{}`)
+	writeFile(t, filepath.Join(admin, "writer.lock"), ``)
+
+	// New code arrives from dev, carrying a stray directive that must never be installed.
+	second := srcWith(t, `{"runner":"_account_admin","v":2}`)
+	writeFile(t, filepath.Join(second, "directive.json"), `{"directive":"ALL_OPS"}`)
+	p2, err := BuildPlan(cfg, acct, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p2.Apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	read := func(name string) string { b, _ := os.ReadFile(filepath.Join(admin, name)); return string(b) }
+	if !strings.Contains(read("config.json"), `"v":2`) {
+		t.Errorf("new code/config not installed: %s", read("config.json"))
+	}
+	if read("directive.json") != `{"directive":"NO_OPS","sequence":7}` {
+		t.Errorf("directive must be the governing one, got %s", read("directive.json"))
+	}
+	if read("state.json") != `{"latches":{"daily":true}}` {
+		t.Errorf("state (latches) must survive, got %s", read("state.json"))
+	}
+	if _, err := os.Stat(filepath.Join(admin, "requests", "done", "r1.json")); err != nil {
+		t.Errorf("request inbox must survive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(admin, "writer.lock")); !os.IsNotExist(err) {
+		t.Errorf("writer.lock is not carried: %v", err)
+	}
+}
+
+// Decommission never removes an account's governance.
+func TestDecommissionRefusesAdmin(t *testing.T) {
+	cfg := testCfg(t)
+	p, err := BuildPlan(cfg, acct, srcWith(t, `{"runner":"_account_admin"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Decommission(cfg, "fxify.demo/_account_admin"); err == nil || !strings.Contains(err.Error(), "governance") {
+		t.Fatalf("want a governance refusal, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(p.TargetDir, "run.py")); err != nil {
+		t.Errorf("the Admin must stay installed: %v", err)
+	}
+}

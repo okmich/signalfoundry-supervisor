@@ -26,8 +26,11 @@ type System struct {
 	Timeframe      string   // single-trader only (the path label)
 	Symbols        []string // multi-trader only: the logical-system symbols it carries
 	Multi          bool
-	Dir            string // the artefact directory
-	RunPy          string // path to run.py (what the Supervisor spawns)
+	// Runner: a run.py directly under the account folder that is not a multi-trader (e.g. the Account
+	// Admin). Its log root is its folder name and its logical systems come from its status.json.
+	Runner bool
+	Dir    string // the artefact directory
+	RunPy  string // path to run.py (what the Supervisor spawns)
 }
 
 // Problem is something under LIVE_BASE that looks like a system but cannot be run: a run.py outside an
@@ -37,10 +40,6 @@ type Problem struct {
 	Path   string // relative to LIVE_BASE
 	Reason string
 }
-
-// AdminStateDir is the Account Admin's live state folder inside an account (ACCOUNT_ADMIN_SPEC §3.1). It
-// is never an artefact, so discovery does not look inside it.
-const AdminStateDir = "account-admin"
 
 // Scan reads liveBase's account folders (<broker>.<env>) and walks each for run.py files, classifying
 // each by its sibling config.json: a non-empty `strategies[]` is a multi-trader (LOGGING_CONTRACT §7.1,
@@ -84,7 +83,7 @@ func scanAccount(liveBase, account string) ([]System, []Problem) {
 			return nil //nolint:nilerr // skip unreadable entries, keep scanning
 		}
 		if d.IsDir() {
-			if path != accDir && (strings.HasPrefix(d.Name(), ".") || d.Name() == AdminStateDir) {
+			if path != accDir && strings.HasPrefix(d.Name(), ".") {
 				return filepath.SkipDir
 			}
 			return nil
@@ -103,9 +102,17 @@ func scanAccount(liveBase, account string) ([]System, []Problem) {
 			return nil
 		}
 		parts := strings.Split(filepath.ToSlash(rel), "/")
+		if len(parts) == 1 { // a runner: its folder is its identity and its log root
+			name := parts[0]
+			out = append(out, System{
+				SystemID: account + "/" + name, Account: account, Strategy: name, RunnerStrategy: name,
+				Runner: true, Dir: dir, RunPy: path,
+			})
+			return nil
+		}
 		if len(parts) != 3 {
 			problems = append(problems, Problem{Path: filepath.ToSlash(filepath.Join(account, rel)),
-				Reason: "run.py is neither at <strategy>/<symbol>/<timeframe> nor beside a multi-trader config.json"})
+				Reason: "run.py is not directly under the account folder, beside a multi-trader config.json, or at <strategy>/<symbol>/<timeframe>"})
 			return nil
 		}
 		strat, sym, tf := parts[0], parts[1], parts[2]

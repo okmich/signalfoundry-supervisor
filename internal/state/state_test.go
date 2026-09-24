@@ -217,3 +217,32 @@ func TestReconcileReportsProblems(t *testing.T) {
 		t.Fatalf("problems = %+v", problems)
 	}
 }
+
+// A runner (the Account Admin) reconciles like a multi-trader: its status.json sits at <log>/<account>/<folder>/
+// and its liveness legs come from its logical_systems[], so its per-minute heartbeat drives the bar age.
+func TestReconcileRunnerFolder(t *testing.T) {
+	cfg, live, logb := box(t)
+	if err := os.MkdirAll(filepath.Join(live, "_account_admin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(live, "_account_admin", "run.py"), nil, 0o644)
+	root := filepath.Join(logb, "_account_admin")
+	writeStatus(t, root, fmt.Sprintf(`{"state":"running","pid":%d,"account":"fxify.demo","account_id":"42",`+
+		`"logical_systems":[{"logical_system_id":"_account_admin/account/1","symbol":"account","timeframe":1}]}`, os.Getpid()))
+	inf := filepath.Join(root, "account", "1", "inference")
+	if err := os.MkdirAll(inf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	line := fmt.Sprintf(`{"event":"bar","asof_bar_ts":%q}`+"\n", now.Add(-time.Minute).Format(time.RFC3339Nano))
+	_ = os.WriteFile(filepath.Join(inf, "inference_"+now.Format("20060102")+".jsonl"), []byte(line), 0o644)
+
+	systems, problems := Reconcile(cfg)
+	if len(problems) != 0 || len(systems) != 1 {
+		t.Fatalf("systems=%+v problems=%+v", systems, problems)
+	}
+	s := systems[0]
+	if s.SystemID != "fxify.demo/_account_admin" || s.State != ipc.StateRunning || len(s.Legs) != 1 || s.Legs[0].Timeframe != "1" || s.LastBarTS.IsZero() {
+		t.Fatalf("admin row = %+v", s)
+	}
+}

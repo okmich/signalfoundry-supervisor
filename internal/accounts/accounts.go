@@ -19,6 +19,16 @@ import (
 // EnvVar is the per-process variable the engine injects at spawn so a runner knows its account.
 const EnvVar = "OKMICH_QUANT_ACCOUNT"
 
+// AdminFolder is the Account Admin's folder inside an account, <live_base>/<account>/_account_admin: its code
+// and config, and the governance files it writes there (ACCOUNT_ADMIN_SPEC §3). It is an ordinary runner to
+// the supervisor, except that its governance must never be undone as a side effect: see AdminRuntime.
+const AdminFolder = "_account_admin"
+
+// AdminRuntime are the files the Admin writes into its own folder at run time. An import never takes them
+// from the source and always carries the current ones into the new copy; losing them would leave the
+// account ungoverned (no directive) or forget tripped latches (no state).
+var AdminRuntime = []string{"directive.json", "state.json", "writer.lock", "requests"}
+
 // namePattern mirrors okmich_quant_core.account._ACCOUNT_PATTERN: lower-case snake tokens, one dot.
 var namePattern = regexp.MustCompile(`^[a-z0-9_]+\.[a-z0-9_]+$`)
 

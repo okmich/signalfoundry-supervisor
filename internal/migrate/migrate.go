@@ -255,8 +255,7 @@ func (p *Plan) checkNothingRuns(cfg config.Config) {
 	}
 }
 
-// flatDirs lists base's top-level folders that are not already account folders, dot-dirs or the
-// reserved Account Admin state folder.
+// flatDirs lists base's top-level folders that are not already account folders or dot-dirs.
 func flatDirs(base string) ([]string, error) {
 	entries, err := os.ReadDir(base)
 	if err != nil {
@@ -268,7 +267,7 @@ func flatDirs(base string) ([]string, error) {
 	var out []string
 	for _, e := range entries {
 		n := e.Name()
-		if e.IsDir() && !strings.HasPrefix(n, ".") && !accounts.Valid(n) && n != "account-admin" {
+		if e.IsDir() && !strings.HasPrefix(n, ".") && !accounts.Valid(n) {
 			out = append(out, n)
 		}
 	}

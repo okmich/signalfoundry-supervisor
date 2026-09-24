@@ -64,12 +64,13 @@ func Reconcile(cfg config.Config) ([]ipc.System, []ipc.Problem) {
 			// "" -> the details left pane degrades to "(no log yet)".
 			LogPaths: ipc.LogPaths{Status: statusPath, Text: newestTextLog(filepath.Dir(statusPath))},
 		}
-		if !c.Multi {
+		runnerRoot := c.Multi || c.Runner // one status.json at its own root; legs from its logical_systems[]
+		if !runnerRoot {
 			s.LogPaths.Inference = contract.InferenceDir(cfg.LogBase, c.Account, c.RunnerStrategy, c.Symbol, c.Timeframe)
 		}
 		// A multi-trader's status.json IS its own runner root, so the coverage gate (which protects a
 		// single-trader row from a sibling's runner file) does not apply.
-		if rs, err := contract.ReadStatus(statusPath); err == nil && (c.Multi || runnerCovers(rs, c.Symbol)) {
+		if rs, err := contract.ReadStatus(statusPath); err == nil && (runnerRoot || runnerCovers(rs, c.Symbol)) {
 			s.PID, s.StartToken = rs.PID, rs.RunnerStartToken
 			s.Broker, s.AccountID, s.SessionID = rs.Broker, rs.AccountID, rs.BrokerSessionID
 			s.StartedAt = rs.StartedAt
@@ -77,7 +78,7 @@ func Reconcile(cfg config.Config) ([]ipc.System, []ipc.Problem) {
 			case rs.State == "running" && proc.Alive(rs.PID):
 				s.State = ipc.StateRunning
 				s.AccountMismatch = accountMismatch(c.Account, env, rs)
-				if c.Multi {
+				if runnerRoot {
 					// Runner-level liveness: one leg per logical system (its own symbol + timeframe),
 					// taken from status.json's logical_systems[] — the authoritative symbol/timeframe
 					// map, since the config.json discovery reads carries no timeframe. The engine

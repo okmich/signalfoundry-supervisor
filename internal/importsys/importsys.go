@@ -45,6 +45,7 @@ type Plan struct {
 	SourceDir   string
 	Account     string // the account folder it is installed into (<broker>.<env>)
 	Multi       bool
+	Runner      bool     // installed directly under the account folder, named by config.json `runner`
 	Strategy    string   // strategy code (the path label)
 	Symbol      string   // single-trader only
 	Symbols     []string // multi-trader only
@@ -62,6 +63,7 @@ type strategyEntry struct {
 
 type sysConfig struct {
 	Name       string          `json:"name"`
+	Runner     string          `json:"runner"` // a runner artefact, installed at <account>/<runner>
 	Strategy   *strategyEntry  `json:"strategy"`
 	Strategies []strategyEntry `json:"strategies"`
 }
@@ -153,8 +155,15 @@ func BuildPlan(cfg config.Config, account, sourceDir string) (Plan, error) {
 		p.Strategy, p.Symbol, p.Timeframe = s.Name, s.Symbol, s.Timeframe
 		p.SystemID = account + "/" + strat + "/" + sym + "/" + tf
 		p.TargetDir = filepath.Join(cfg.LiveBase, account, strat, sym, tf)
+	case sc.Runner != "": // a runner (e.g. the Account Admin): its folder is its identity and its log root
+		if err := validateToken("runner", sc.Runner); err != nil {
+			return Plan{}, err
+		}
+		name := pathSafe(sc.Runner)
+		p.Runner, p.Strategy, p.SystemID = true, name, account+"/"+name
+		p.TargetDir = filepath.Join(cfg.LiveBase, account, name)
 	default:
-		return Plan{}, fmt.Errorf("config.json classifies as neither single (a `strategy` object) nor multi (a non-empty `strategies[]`)")
+		return Plan{}, fmt.Errorf("config.json classifies as neither single (a `strategy` object), multi (a non-empty `strategies[]`) nor a runner (`runner`)")
 	}
 
 	if _, err := os.Stat(p.TargetDir); err == nil {
@@ -185,6 +194,12 @@ func (p Plan) Apply(cfg config.Config) (archivedTo string, err error) {
 	if err := copyTree(p.SourceDir, staging); err != nil {
 		_ = os.RemoveAll(staging)
 		return "", fmt.Errorf("stage copy: %w", err)
+	}
+	if p.isAdmin() {
+		if err := carryAdminRuntime(p.TargetDir, staging); err != nil {
+			_ = os.RemoveAll(staging)
+			return "", fmt.Errorf("carry the Account Admin's governance files: %w", err)
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(p.TargetDir), 0o755); err != nil {
 		_ = os.RemoveAll(staging)
@@ -236,6 +251,10 @@ func Decommission(cfg config.Config, systemID string) (archivedTo string, err er
 	if target == "" {
 		return "", fmt.Errorf("system %q not found in LIVE_BASE", systemID)
 	}
+	if filepath.Base(target) == accounts.AdminFolder {
+		return "", fmt.Errorf("%s is the Account Admin: decommissioning it would take the account out of governance — "+
+			"follow the out-of-governance runbook (ACCOUNT_ADMIN_SPEC §8.3) instead", systemID)
+	}
 	if err := ensureNotRunning(cfg, systemID); err != nil {
 		return "", err
 	}
@@ -253,6 +272,43 @@ func Decommission(cfg config.Config, systemID string) (archivedTo string, err er
 		return "", fmt.Errorf("archive (rename target->archive): %w", err)
 	}
 	return archivedTo, nil
+}
+
+// isAdmin reports whether the plan installs an account's Account Admin.
+func (p Plan) isAdmin() bool { return p.Runner && p.Strategy == accounts.AdminFolder }
+
+// carryAdminRuntime makes the staged Admin copy hold exactly the governance files of the installed one: it
+// drops any the source brought (a directive is written only by the Admin that governs the account, never
+// shipped) and copies in the current directive, state and request inbox. writer.lock is not carried: the
+// import refuses while the Admin runs, so no lock is held. With no installed copy (first deployment) the
+// staged copy simply starts without them.
+func carryAdminRuntime(installed, staging string) error {
+	for _, name := range accounts.AdminRuntime {
+		if err := os.RemoveAll(filepath.Join(staging, name)); err != nil {
+			return err
+		}
+	}
+	for _, name := range accounts.AdminRuntime {
+		if name == "writer.lock" {
+			continue
+		}
+		src := filepath.Join(installed, name)
+		info, err := os.Stat(src)
+		if os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			err = copyTree(src, filepath.Join(staging, name))
+		} else {
+			err = copyFile(src, filepath.Join(staging, name))
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ensureNotRunning refuses if the registry shows the system_id bound to a live PID.

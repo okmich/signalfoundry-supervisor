@@ -806,3 +806,15 @@ func TestImportWithoutAccounts(t *testing.T) {
 		t.Fatalf("want a no-accounts error, got %+v", m.importing)
 	}
 }
+
+// D on the Account Admin refuses at the keypress: no confirm is armed.
+func TestDecommissionRefusedForAdmin(t *testing.T) {
+	m := testModel(t)
+	m.fleet.Systems = []ipc.System{{SystemID: "fxify.demo/_account_admin", Account: "fxify.demo", State: ipc.StateStopped}}
+	m.cursor = 0
+	armed, _ := m.handleKey(key("D"))
+	mm := armed.(model)
+	if mm.confirm != nil || !strings.Contains(mm.status, "governance") {
+		t.Fatalf("want a refusal without a confirm, got confirm=%+v status=%q", mm.confirm, mm.status)
+	}
+}

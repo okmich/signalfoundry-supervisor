@@ -54,8 +54,7 @@ func TestScanClassifiesSingleAndMulti(t *testing.T) {
 }
 
 // TestScanSkipsDotDirs verifies the importer's archive/staging subtrees (and any dot-dir) are not
-// mistaken for live systems even though they contain run.py copies, and that the Account Admin's live
-// state folder is never walked.
+// mistaken for live systems even though they contain run.py copies.
 func TestScanSkipsDotDirs(t *testing.T) {
 	root := t.TempDir()
 	write(t, filepath.Join(root, acct, "strat", "EURUSD", "5", "run.py"), "")
@@ -63,7 +62,6 @@ func TestScanSkipsDotDirs(t *testing.T) {
 	write(t, filepath.Join(root, ".archive", acct, "strat", "EURUSD", "5", "20200101T000000Z", "run.py"), "")
 	write(t, filepath.Join(root, ".staging", "fxify.demo_strat_EURUSD_5", "run.py"), "")
 	write(t, filepath.Join(root, acct, ".tmp", "x", "y", "run.py"), "")
-	write(t, filepath.Join(root, acct, "account-admin", "a", "b", "run.py"), "")
 
 	cat, probs, err := Scan(root)
 	if err != nil || len(probs) != 0 {
@@ -96,5 +94,27 @@ func TestScanReportsSystemsOutsideAccounts(t *testing.T) {
 	}
 	if len(probs) != 2 || !paths["ctlpb_raw-multi"] || !paths["fxify.demo/strat/EURUSD"] {
 		t.Fatalf("problems = %+v", probs)
+	}
+}
+
+// A run.py directly under the account folder is a runner named after its folder (the Account Admin is one):
+// no timeframe in the live path, its log root is its folder name.
+func TestScanFindsRunnerFolders(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, acct, "_account_admin", "run.py"), "")
+	write(t, filepath.Join(root, acct, "_account_admin", "config.json"), `{"runner":"_account_admin","cycle_s":20}`)
+	write(t, filepath.Join(root, acct, "_account_admin", "directive.json"), "{}")
+	write(t, filepath.Join(root, acct, "_account_admin", "requests", "done", "r1.json"), "{}")
+
+	cat, probs, err := Scan(root)
+	if err != nil || len(probs) != 0 {
+		t.Fatal(err, probs)
+	}
+	if len(cat) != 1 {
+		t.Fatalf("want the one runner, got %+v", cat)
+	}
+	s := cat[0]
+	if s.SystemID != "fxify.demo/_account_admin" || !s.Runner || s.Multi || s.RunnerStrategy != "_account_admin" || s.Account != acct {
+		t.Fatalf("runner = %+v", s)
 	}
 }

@@ -11,13 +11,20 @@
 > by regression tests. **Under live MT5 testing as of 2026-06-07** — single + multi-trader
 > start/stop/restart, import, and decommission exercised via the TUI on a Deriv-Demo terminal, and it
 > is looking good.
+> **Account layout (2026-09-25).** `<live_base>` and `<log_base>` are laid out by account,
+> `<base>\<account>\...`, the account being the broker env-file stem (`fxify.demo`). The account folder is the
+> single source of truth for which broker a system trades: the Supervisor passes it to each system it starts as
+> `OKMICH_QUANT_ACCOUNT`, groups the fleet by it, checks each running system against it, and refuses a start
+> whose account env file is missing or incomplete (§7, §13, §16). The Account Admin is an ordinary runner in
+> its account folder whose governance is never undone as a side effect (§3, §16). See
+> [ACCOUNT_LAYOUT_CHANGE_PLAN.md](../../signalfoundry-lab/docs/ops/ACCOUNT_LAYOUT_CHANGE_PLAN.md).
 > Companion contracts (`LOGGING_CONTRACT.md`,
 > `OPS_REFERENCE_GUIDE.md`) live in the sibling `signalfoundry-lab` repo.
 > Scope: the per-box **Supervisor** (a process control plane for live trading
 > systems) and a high-level pointer to the future cross-box **Fleet Manager**.
-> Companion to [OPS_REFERENCE_GUIDE.md](../../signalfoundry-lab/docs/OPS_REFERENCE_GUIDE.md): this spec
+> Companion to [OPS_REFERENCE_GUIDE.md](../../signalfoundry-lab/docs/ops/OPS_REFERENCE_GUIDE.md): this spec
 > *consumes* that guide's folder layouts, environment variables, log conventions,
-> and `<strategy>/<symbol>/<timeframe>` path shape. The two are complementary —
+> and `<account>/<strategy>/<symbol>/<timeframe>` path shape. The two are complementary —
 > the OPS guide defines the deployment substrate; this spec defines the process
 > that starts, stops, and watches the things deployed onto it.
 
@@ -77,14 +84,15 @@ each" model does not scale; the Supervisor replaces it.
 ## 2. Relationship to the OPS guide
 
 This spec does not redefine the deployment substrate; it reuses it. From
-[OPS_REFERENCE_GUIDE.md](../../signalfoundry-lab/docs/OPS_REFERENCE_GUIDE.md):
+[OPS_REFERENCE_GUIDE.md](../../signalfoundry-lab/docs/ops/OPS_REFERENCE_GUIDE.md):
 
 | Borrowed from the OPS guide | Used here for |
 |---|---|
-| `<strategy>/<symbol>/<timeframe>/` path shape | Identifying and discovering systems |
-| `OKMICH_QUANT_LIVE_BASE` (`<live_base>`) | Where the artefact + `run.py` per system live (trader box) |
+| `<account>/` folders, each holding `<strategy>/<symbol>/<timeframe>/`, `<strategy>-multi/` and runner folders | Identifying, grouping and discovering systems ([§16](#16-folder-and-ipc-layout)) |
+| `OKMICH_QUANT_LIVE_BASE` (`<live_base>`) | Where the artefact + `run.py` per system live (trader box), one folder per account |
 | `OKMICH_QUANT_LOG_BASE` (`<log_base>`) | Where each system's inference JSONL is read from; deployment examples such as `D:\quant_logs` live in the OPS guide, not in source defaults |
-| `OKMICH_QUANT_ENV_DIR` (`<env_dir>`) | Where machine-local broker/session `.env` files live; referenced by config, never copied into artefacts |
+| `OKMICH_QUANT_ENV_DIR` (`<env_dir>`) | Where machine-local broker/session `.env.<account>` files live; the list of accounts on the box; never copied into artefacts |
+| `OKMICH_QUANT_ACCOUNT` | Set by the Supervisor for each process it starts, from the system's account folder; never a machine-level variable ([§16](#16-folder-and-ipc-layout)) |
 | `config.json` per (strategy, symbol, timeframe) | Source of `signal_params`, broker bindings — read-only to the Supervisor |
 | JSONL inference log (`JsonlEventLogger`) | The liveness + behavior stream (per-bar heartbeat + breaker events) |
 | Runner status file (`status.json` / `RunnerStatus`) | Runner lifecycle state + the clean-disconnect (shutdown) proof |
@@ -95,7 +103,7 @@ section. Neither document repeats the other.
 
 ## 3. Principles
 
-The design derives from five invariants. Every contract below traces to one.
+The design derives from six invariants. Every contract below traces to one.
 
 | Principle | Implication |
 |---|---|
@@ -104,6 +112,7 @@ The design derives from five invariants. Every contract below traces to one.
 | **Ops never manages trades** | "Stop a system" means *stop the process, cleanly, leaving the book exactly as it is.* There is no flatten/close/position capability anywhere on this plane — the safety is **structural, not a safe default**. |
 | **Separation is organizational, not enforced** | Ops admin and trade analyst are distinct roles that ideally communicate, but the system does not enforce that handshake. The Supervisor makes no trade decision and *surfaces* what an analyst would need to see — it does not block on, or arbitrate, the human coordination. |
 | **One system, one OS process** | Each trading system is one top-level process — one PID, one Task Manager entry. The Supervisor's killable/signalable unit is the OS process. |
+| **Governance is never undone as a side effect** | Once an Account Admin governs an account, no ops action of the Supervisor removes or resets that governance in passing: importing new Admin code keeps its governance files, and decommissioning the Admin is refused. Ending governance is a deliberate runbook step ([ACCOUNT_ADMIN_SPEC §8.3](../../signalfoundry-lab/docs/ops/ACCOUNT_ADMIN_SPEC.md), [§16](#16-folder-and-ipc-layout)). |
 
 ## 4. Organizational boundary — ops admin vs trade analyst
 
@@ -133,6 +142,13 @@ action. Ideally ops tells the analyst; the system does not require it.
 > Supervisor flags that (see [§11](#11-stop--restart-verification-and-sequences)).
 > Orphaned **connection** = ops; open or unprotected **position** = trade. The line
 > is sharp, and the Supervisor sits entirely on the connection side of it.
+
+> **The account check is identity, not a trade judgment.** The Supervisor checks that each running system
+> is logged into the account its folder claims: the `account` in its `status.json` against the folder, and
+> the terminal's login against the account env file's `LOGIN_ID` ([§7](#7-terminal--account-topology-and-blast-radius)).
+> A mismatch is flagged and alerted. That is the same kind of fact as "is this PID the process we started" —
+> it says nothing about positions, exposure or whether the trades are right, and the Supervisor acts on it only
+> by telling the operator.
 
 ## 5. Vocabulary: Supervisor vs Fleet Manager
 
@@ -195,6 +211,18 @@ terminal crashes.**
   - **Legs (symbols)** — the exposure/concentration unit; reported, never capped.
 - The fleet view must answer: *"if terminal X dies, which systems go dark?"* —
   i.e. it models `systems → terminal (broker session) → account`.
+- **The grouping is declared, not observed.** Each account folder `<live_base>\<account>\` names one broker
+  env file, `.env.<account>`, which names one terminal (`TERMINAL_PATH`) and one login (`LOGIN_ID`). So the
+  Supervisor groups the fleet by account folder: a group exists, with its stopped systems, even when nothing in
+  it runs, and a system cannot drift into another account's group by where it happened to log in.
+- The cap and the leg count cover the account's **live** processes (running or in flight), the ones that hold
+  terminal slots. The cap is **reported, never enforced**: an account over 10 is shown `OVER CAP`, and no start
+  is refused for it.
+- **Account check.** Each running system is checked against its folder: the `account` its `status.json` was
+  written under must be the folder, and the login its terminal reports (`account_id`) must be the env file's
+  `LOGIN_ID`. A mismatch is shown on the row and alerted once per episode ([§4](#4-organizational-boundary--ops-admin-vs-trade-analyst)).
+  A system started by hand under a different account logs under that account's folder, so its own row reads
+  stopped rather than mismatched; the login check still catches a terminal on the wrong account.
 
 ## 8. Lifecycle state machine
 
@@ -414,18 +442,18 @@ The operator's natural verbs over the whole box: *start everything*, *stop every
 transport and no new in-system contract** — each decomposes entirely into the single-system
 sequences above and the start of [§13](#13-startup--operator-initiated-auto-start-deferred).
 
-**Scope (MVP): whole box only.** "All" means *every eligible system on this box*. Per-terminal
-/ per-account bulk (the natural [§7](#7-terminal--account-topology-and-blast-radius) blast-radius
-selector) and an arbitrary selected set are a **deliberate future extension** — the `terminals[]`
-grouping the engine already publishes ([§16](#16-folder-and-ipc-layout)) is where that selector
-attaches when it lands.
+**Scope: the whole box, or one account.** "All" means *every eligible system on this box*. The same
+operation can be narrowed to one account, the natural [§7](#7-terminal--account-topology-and-blast-radius)
+blast-radius selector (one broker down: stop that account, keep the others). In the TUI, `S` / `X` / `R` arm one
+confirm that offers both: `[y]` the whole box, `[a]` only the selected system's account; any other key cancels.
+An arbitrary selected set remains a future extension.
 
 **Eligibility (idempotent by construction).** A bulk op acts on the eligible subset and **skips**
 the rest; a skip is success, not error. An empty eligible set is a no-op.
 
 | Op | Targets (eligible) | Skips | Confirm? |
 |---|---|---|---|
-| **start-all** | `Stopped` | live / in-flight (`Starting` / `Running` / `Stopping` / `Restarting`); **and** the latched states `StoppedByOperator` / `Crashed` / `CrashLoopHalted` | No |
+| **start-all** | `Stopped` | live / in-flight (`Starting` / `Running` / `Stopping` / `Restarting`); **and** the latched states `StoppedByOperator` / `Crashed` / `CrashLoopHalted` | **Yes** |
 | **stop-all** | `Running` | already-stopped; in-flight (`Stopping` / `Restarting`) | **Yes** |
 | **restart-all** | `Running` | non-running (nothing to restart) | **Yes** |
 
@@ -435,13 +463,12 @@ the rest; a skip is success, not error. An empty eligible set is a no-op.
   / `CrashLoopHalted` latch ([§8](#8-lifecycle-state-machine)): clearing those is a **conscious
   per-system start**, never a side effect of a blanket "start everything." A fleet-wide start must
   not relaunch something an operator stopped on purpose or that is crash-looping against the market.
-  - **Broker-session gate — MVP defers it.** start-all starts every eligible system immediately;
-    the [§13](#13-startup--operator-initiated-auto-start-deferred) precondition check is deferred,
-    so no target is skipped for a red session yet. When the adapter lands, start-all gains the
-    skip-red-and-report behaviour (specified then), consistent with the single-start gate.
+  - **Start gates apply per target.** Each fanned-out start passes the same gates as a single start
+    ([§13](#13-startup--operator-initiated-auto-start-deferred)): a red broker session, or an account whose env
+    file is missing or lacks a session key, refuses that target with the reason in its result; the rest start.
 
-- **stop-all / restart-all** require an **explicit operator confirmation** before any event is
-  fired. A fleet-wide stop is the consequential, blast-radius action [§3](#3-principles) names —
+- **Every bulk op** requires an **explicit operator confirmation** before any event is
+  fired (start-all too: starting a whole box is as consequential as stopping one). A fleet-wide stop is the consequential, blast-radius action [§3](#3-principles) names —
   *"a fleet stop is only the explicit per-system stop commands an operator issues"* — so the UI
   makes that explicitness a deliberate confirm step, not a single keystroke. Per-system stop /
   restart stays a single action.
@@ -466,7 +493,7 @@ uniform; the engine moves each target to `Starting` / `Stopping` and confirms th
 subsequent ticks rather than block-waiting per system. The aggregate is the client folding the
 individual results. (A dedicated bulk command carrying a `scope` selector + a single batch-id is the
 documented **upgrade** — taken only if the per-target fan-out's lack of one audit / confirm record
-actually bites, e.g. when per-terminal selection lands.)
+actually bites.)
 
 ## 12. Supervisor restart and child re-attach
 
@@ -491,6 +518,8 @@ be restarted for admin reasons — *Supervisor lifecycle ≠ trade lifecycle*,
 - Registry staleness: a registry entry whose PID is dead, or alive but whose
   recorded `start_token` does not match, is reconciled to ground truth (`psutil`),
   never trusted blindly.
+- Registry keys are `system_id`s, which carry the account ([§16](#16-folder-and-ipc-layout)). The move to the
+  account layout changes every id, which is why it is a stop-the-fleet cutover: no re-attach spans it.
 
 ## 13. Startup — operator-initiated; auto-start deferred
 
@@ -501,7 +530,7 @@ bring-up needs a human:
   bring-up pattern — dedicated user + autologon + Task-Scheduler-at-logon + `tscon`
   to detach RDP while keeping the session alive — is real work and is **not** a
   Session-0 service. (A Session-0 service is isolated from the interactive session
-  the terminal lives in and fights MT5; see [OPS guide §13](../../signalfoundry-lab/docs/OPS_REFERENCE_GUIDE.md)
+  the terminal lives in and fights MT5; see [OPS guide §13](../../signalfoundry-lab/docs/ops/OPS_REFERENCE_GUIDE.md)
   for the related Win32-binding reality.)
 - **IB Gateway / TWS** needs a human login + 2FA and a **forced daily re-auth /
   restart**. The control plane cannot conjure that.
@@ -522,6 +551,13 @@ safety gate that survives the deferral:
   > session is **green** → Supervisor refuses to start a system whose session is
   > **red**.
 
+- **Account env pre-check (implemented).** A stopped system has no live session to probe, but its
+  account folder already says which session it will need: `.env.<account>` names the terminal and login
+  before anything starts. The Supervisor refuses a start or restart when that file is missing, or lacks a
+  session key its runners need (`TERMINAL_PATH`, `LOGIN_ID`, `LOGIN_SERVER` for MT5; an IB account is
+  recognised by `IB_HOST`), naming what is missing. The account is also listed as a problem in the fleet view.
+  This turns "the runner crashed on its first line" into a refusal that says why.
+
 Deferring auto-start also defers the *adopt-on-restart-at-boot* problem (distinct
 from the always-running-Supervisor re-attach of [§12](#12-supervisor-restart-and-child-re-attach)),
 removing the two thorniest pieces from the MVP.
@@ -533,8 +569,9 @@ What generalizes across brokers and what does not:
 - **Generic core (broker-blind):** spawn process, watch, trigger graceful stop,
   relay logs, restart policy, fleet view. Built once.
 - **Per-broker session adapter (NOT generic):** *health-checking* (and, when
-  auto-start is eventually built, *bringing up*) the broker session, and mapping
-  systems → session. MT5 (interactive-desktop terminal) and IB
+  auto-start is eventually built, *bringing up*) the broker session. Mapping systems → session is no
+  longer adapter work: the account folder gives it (folder → `.env.<account>` → `TERMINAL_PATH` / `LOGIN_ID`),
+  so an adapter can probe the right terminal for a system that is not running yet. MT5 (interactive-desktop terminal) and IB
   (TWS/Gateway socket + 2FA + daily re-auth, automatable via IBC) have genuinely
   different session lifecycles that do not unify.
 
@@ -593,54 +630,70 @@ stays out of the systems' internals:
 
 ## 16. Folder and IPC layout
 
-Reuses OPS-guide roots; adds a Supervisor-owned state directory (registry + ops capture).
-There is **no control directory** — control is a console event to a live PID ([§9](#9-control--targeted-console-ctrlc)), not a file.
+Reuses OPS-guide roots ([OPS §3.1](../../signalfoundry-lab/docs/ops/OPS_REFERENCE_GUIDE.md)); adds a Supervisor-owned state directory (registry + ops
+capture). There is **no control directory** — control is a console event to a live PID ([§9](#9-control--targeted-console-ctrlc)), not a file.
 
 ```
-<env_dir>\                              # machine-local broker env files (OPS §3.4)
-├── .env.<broker>.<profile>             # e.g. .env.deriv.demo, .env.ib.paper.btc
-└── templates\                          # non-secret templates created by setup
+<env_dir>\                                  # machine-local broker env files (OPS §3.4)
+├── .env.<account>                          # one per account: .env.fxify.demo, .env.icmarkets.demo, ...
+└── templates\                              # non-secret templates created by setup
 
-<supervisor_state>\                     # Supervisor's own state (live box)
-├── process_registry.json               # system_id → {pid, start_token, terminal_id, account_id, state}
-├── settings.json                        # operator-tunable runtime policy (wedge alert gate + thresholds, §15); engine live-reads, TUI edits
-└── ops\
-    └── <system_id>_stdout_<YYYYMMDD>.log   # raw stdout/stderr capture (crash forensics)
+<supervisor_state>\                         # Supervisor's own state (live box)
+├── process_registry.json                   # system_id → {pid, start_token, create_time}
+├── settings.json                           # operator-tunable runtime policy (wedge alert gate + thresholds, §15)
+├── fleet_state.json                        # the published fleet: systems, accounts, problems
+└── commands\                               # TUI → engine command files (one per single-system action)
 
-# Consumed read-only from OPS-guide roots:
-<live_base>\<strategy>\<symbol>\<timeframe>\run.py        # what the Supervisor spawns
-<log_base>\<strategy>\<symbol>\<timeframe>\inference\inference_<YYYYMMDD>.jsonl   # per-symbol bar/breaker stream it tails (liveness + behavior)
-<log_base>\<strategy>[-multi]\status.json                 # ONE runner-root lifecycle file it reads (running/stopped + disconnect proof + restart token); -multi marks a multi-trader
+# Consumed from OPS-guide roots:
+<live_base>\<account>\                      # <account> = the env-file stem <broker>.<env>
+├── <strategy>\<symbol>\<timeframe>\run.py  # a single-trader
+├── <strategy>-multi\run.py                 # a multi-trader (config.json with a non-empty strategies[])
+└── <runner>\run.py                         # a runner, e.g. _account_admin (the Account Admin)
+<log_base>\<account>\<root>\status.json     # ONE lifecycle file per process: running/stopped + disconnect proof + restart token
+<log_base>\<account>\<root>\<symbol>\<timeframe>\inference\inference_<YYYYMMDD>.jsonl   # per-leg bar/breaker stream (liveness + behavior)
 ```
 
-- `system_id` — a stable identifier per logical system. For a `trader`, the
-  `<strategy>/<symbol>/<timeframe>` triple suffices; for a `multi-trader`, the PID
-  carries several logical systems, so `system_id` distinguishes the **PID-level unit**
-  the Supervisor stops (one Ctrl+C → one PID, [§9](#9-control--targeted-console-ctrlc))
-  from the **system-level units** tracked for blast radius
-  ([§7](#7-terminal--account-topology-and-blast-radius)). A multi-trader is stopped as a
-  **unit** (one PID, one broker session); per-symbol stop is not offered, by construction.
+- **Accounts.** Every top-level folder of `<live_base>` named like `<broker>.<env>` is an account; its env file is
+  `<env_dir>\.env.<account>`. The Supervisor reads only identity keys from it (`LOGIN_ID`, `LOGIN_SERVER`,
+  `BROKER_NAME`, `TERMINAL_PATH`, `IB_HOST`), never secrets. Dot-folders (`.archive`, `.staging`) are the
+  importer's own.
+- **`system_id`** — a stable identifier per PID-level unit, always prefixed by its account:
+  - a single-trader: `<account>/<strategy>/<symbol>/<timeframe>` (its path);
+  - a multi-trader: `<account>/<strategy>-multi` (one PID, N symbols; stopped as a **unit**, per-symbol stop is
+    not offered, by construction);
+  - a runner: `<account>/<folder>`, for a `run.py` directly under the account folder that is not a multi-trader.
+    Its folder is its identity and its log root; its liveness legs come from its `status.json`. The Account
+    Admin is one (`<account>/_account_admin`).
+
+  The id distinguishes the **PID-level unit** the Supervisor stops (one Ctrl+C → one PID,
+  [§9](#9-control--targeted-console-ctrlc)) from the **system-level units** tracked for blast radius
+  ([§7](#7-terminal--account-topology-and-blast-radius)).
+- **Problems.** A `run.py` outside an account folder (the pre-account flat layout), or at a path that is none
+  of the three shapes, and an account whose env file is missing or incomplete, are published as problems in the
+  fleet view. A problem is never started.
+- **The account is passed, not configured.** The Supervisor starts each `run.py` (no arguments, cwd = its folder)
+  with its own environment plus `OKMICH_QUANT_ACCOUNT=<account>`, always overriding any inherited value. The
+  runner loads `<env_dir>\.env.<account>` from it and the framework logs under `<log_base>\<account>\`
+  (LOGGING_CONTRACT §10). A supervised launch and a manual one differ only in who sets the variable.
+- **Import** provisions an artefact into an account the operator picks (the TUI lists the accounts that have an
+  env file): a staged copy, the current one archived to `.archive\<account>\...`, then an atomic rename. A runner
+  artefact declares itself with `"runner": "<name>"` in its `config.json`. **Decommission** archives one system
+  the Supervisor currently discovers — never a path built from an id — and refuses while it runs.
+- **The Account Admin is the one exception** ([§3](#3-principles)): importing into `_account_admin` carries the
+  installed `directive.json`, `state.json` and `requests\` into the new copy and never takes them from the
+  source; decommissioning it is refused ([ACCOUNT_ADMIN_SPEC §3, §8.3, §9](../../signalfoundry-lab/docs/ops/ACCOUNT_ADMIN_SPEC.md)).
+- **`supervisor migrate-layout`** moves a flat box into this layout once (dry run by default, `--apply` to move;
+  refuses while anything runs; proves every move before making the first) — the cutover of
+  [ACCOUNT_LAYOUT_CHANGE_PLAN §5](../../signalfoundry-lab/docs/ops/ACCOUNT_LAYOUT_CHANGE_PLAN.md).
 - `process_registry.json` is the re-attach source of truth
   ([§12](#12-supervisor-restart-and-child-re-attach)), always reconciled against
   `psutil`, never trusted blindly.
 - `<supervisor_state>` is resolved from `OKMICH_QUANT_SUPERVISOR_STATE_DIR`, a required
   production env var: a missing or unusable value fails fast at Supervisor startup. Any
   `D:\...` examples in the OPS guide are deployment examples, not source-code defaults.
-  (No control directory is needed — control is a console event to a live PID,
-  [§9](#9-control--targeted-console-ctrlc), not a file.)
-- `<env_dir>` is resolved from `OKMICH_QUANT_ENV_DIR` and is created/permission-
-  checked by Supervisor setup before any trading system is deployed or started.
-  The Supervisor resolves a system's configured `env_profile` / `env_file` against
-  this root and refuses start if the broker env file is missing or does not satisfy
-  the broker-session adapter's required keys. Env filenames/profile IDs are audit
-  data; secret values are never logged.
-  - **MVP (2026-06-07).** The Supervisor spawns each `run.py` inheriting `OKMICH_QUANT_ENV_DIR`, and
-    the system resolves + loads its **own** broker `.env` from that root (its `--env-file` default
-    resolves against `<env_dir>`, falling back to the artefact dir only when the var is unset) — so no
-    flags are passed and a supervised launch matches a manual one. The Supervisor-side `env_profile`/
-    `env_file` resolution + start-refusal described above is part of the deferred broker-session gate
-    (§13/§14); the scaffold refuses start on a `red` session, but the real env/key pre-check arrives
-    with the per-broker probe.
+- `<env_dir>` is resolved from `OKMICH_QUANT_ENV_DIR` and is created/permission-checked by Supervisor setup
+  before any trading system is deployed or started. Env filenames are audit data; secret values are never
+  read or logged.
 
 ### 16.1 Supervisor setup / bootstrap responsibilities
 
@@ -650,12 +703,14 @@ until setup has completed these one-time tasks:
 1. Verify broker platform prerequisites and ops utilities are installed.
 2. Define required machine-level env vars:
    `OKMICH_QUANT_LIVE_BASE`, `OKMICH_QUANT_LOG_BASE`, `OKMICH_QUANT_ENV_DIR`, and
-   `OKMICH_QUANT_SUPERVISOR_STATE_DIR`.
+   `OKMICH_QUANT_SUPERVISOR_STATE_DIR`. **Never** define `OKMICH_QUANT_ACCOUNT` at machine level: it is per
+   process, set by the Supervisor from the account folder (a machine-wide value would mislead manual runs).
 3. Create and permission-check `<live_base>`, `<log_base>`, `<env_dir>`, and
    `<supervisor_state>`.
 4. Install non-secret broker env templates under `<env_dir>\templates\`.
-5. Validate that operator-populated broker `.env` files referenced by configured
-   systems exist and contain the adapter-required keys.
+5. Create one account folder `<live_base>\<account>\` per operator-populated `.env.<account>`, and check each
+   env file carries its session keys ([§13](#13-startup--operator-initiated-auto-start-deferred)). The running
+   Supervisor re-checks this every tick and lists any gap as a problem.
 
 Only after this bootstrap succeeds should artefacts be deployed or trading systems
 be started. Runtime code still fails fast if a required root or broker env file is
@@ -699,6 +754,11 @@ only; full design is future work.
 > ([§7](#7-terminal--account-topology-and-blast-radius), [§16](#16-folder-and-ipc-layout));
 > there is no longer a "how does one command address N systems" question.
 
+> **Resolved 2026-09-25 — which account a system trades.** It was a hardcoded `--env-file` default inside each
+> `run.py`, invisible to the Supervisor until the system ran. It is now the system's account folder
+> ([§16](#16-folder-and-ipc-layout)), passed as `OKMICH_QUANT_ACCOUNT`, grouped in the fleet view and checked at
+> run time ([§7](#7-terminal--account-topology-and-blast-radius)).
+
 Remaining open items:
 3. **Restart policy specifics** — backoff curve, crash-loop N/M thresholds, and
    whether the MVP enables auto-restart on `Crashed` at all or treats it as
@@ -712,16 +772,19 @@ Remaining open items:
 |---|---|
 | **Supervisor** | The per-box process control plane: discover / start / stop / restart / watch trading systems, with a local UI client. The subject of this spec. |
 | **Fleet Manager** | The future cross-box office layer that aggregates many Supervisors via outbound telemetry. |
-| **Trading system** | One deployed strategy instance run as one OS process; either a `trader` (one symbol) or a `multi-trader` (N symbols, one PID). |
+| **Trading system** | One deployed strategy instance run as one OS process; a `trader` (one symbol), a `multi-trader` (N symbols, one PID) or a runner. |
+| **Account** | A broker env-file stem `<broker>.<env>` (`fxify.demo`): one env file, one terminal, one login. The first folder level under `<live_base>` and `<log_base>`; the Supervisor passes it to each system as `OKMICH_QUANT_ACCOUNT` ([§16](#16-folder-and-ipc-layout)). |
+| **Runner** | A `run.py` directly under an account folder that is not a multi-trader; its folder is its id and its log root. The Account Admin is one ([§16](#16-folder-and-ipc-layout)). |
+| **Account check** | The run-time check that a running system is logged into the account its folder claims; identity, not a trade judgment ([§4](#4-organizational-boundary--ops-admin-vs-trade-analyst), [§7](#7-terminal--account-topology-and-blast-radius)). |
 | **Logical system** | One OS process = one broker connection = one MT5 terminal IPC slot (`mt5.initialize()` binds per-process); the unit of blast radius and of the ≤10/terminal cap. A `multi-trader` is **one** logical system carrying several **legs**. |
 | **Leg** | One symbol inside a logical system. A 4-symbol `multi-trader` is 1 logical system / 4 legs. Legs drive account concentration (shared margin, magic-number namespace), are reported per terminal, and are never capped ([§7](#7-terminal--account-topology-and-blast-radius)). |
 | **Control (stop)** | The Supervisor→system stop transport: a targeted `CTRL_C_EVENT` delivered to one child via AttachConsole ([§9](#9-control--targeted-console-ctrlc)), reusing the system's existing Ctrl+C graceful path. No in-system listener. |
-| **Bulk operation** | A whole-box `start-all` / `stop-all` / `restart-all` issued by the operator — a fan-out of single-system commands over the eligible subset, not a new transport; per-terminal / selected-set bulk is a deferred extension ([§11.1](#111-bulk-operations--start-all--stop-all--restart-all)). |
+| **Bulk operation** | A `start-all` / `stop-all` / `restart-all` over the whole box or one account, confirmed by the operator — a fan-out of single-system commands over the eligible subset, not a new transport; an arbitrary selected set is a deferred extension ([§11.1](#111-bulk-operations--start-all--stop-all--restart-all)). |
 | **Shutdown proof** | The `stopped` write to the runner **status file** (`status.json`) in `graceful_shutdown()`, proving a clean broker **connection** disconnect (`broker_disconnected: true`) — a status-file write, not a stream record (v1.1.0; LOGGING_CONTRACT §7.1/§7.4). Carries no position/exposure fields — exposure is a trade concern, invisible to the Supervisor ([§3](#3-principles), [§4](#4-organizational-boundary--ops-admin-vs-trade-analyst), [§10](#10-graceful-shutdown-contract-system-owned)). |
 | **Start token** | An identifier a system records at startup (in `status.json`); ops's restart-detection signal and the PID-reuse guard checked before a stop is fired at a PID ([§9](#9-control--targeted-console-ctrlc)). |
 | **Graceful shutdown** | System-owned routine: stop new risk, leave the book, disconnect the broker cleanly, write the `stopped` status file, exit 0. |
 | **Orphan (connection)** | A broker API connection left half-open by a hard kill (no clean `eDisconnect`/`mt5.shutdown`); the failure mode graceful shutdown exists to prevent. |
-| **Blast radius** | The set of logical systems that fail together when a shared broker terminal/account fails. |
+| **Blast radius** | The set of logical systems that fail together when a shared broker terminal/account fails; in the fleet view, an account folder's systems. |
 | **Re-attach** | A restarted Supervisor re-discovering and resuming control of still-running children, without relaunching them. Distinct from auto-start. |
 | **Broker-session adapter** | The per-broker (MT5 / IB) component that health-checks (later: brings up) a broker session; never places trades. |
 

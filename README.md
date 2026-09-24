@@ -70,37 +70,49 @@ from the TUI on a Deriv-Demo terminal, and it is looking good.
   live-read); Telegram alerts from `notifier.env`.
 - **Re-attach + registry (§12)** — create-time PID-reuse guard with a persistent identity baseline;
   the engine re-attaches to running children on restart without relaunching.
-- **Blast-radius (§7)** — broker-terminal grouping + the ≤10-logical-systems cap.
+- **Accounts (§7, §16)** — `LIVE_BASE` and `LOG_BASE` are laid out by account (`<base>\<account>\...`, the
+  broker env-file stem). The fleet is grouped by account folder, stopped systems included, with the ≤10
+  logical-systems cap (reported, never enforced) and leg count per account. Each running system is checked
+  against its folder (status.json account, terminal login vs the env file's `LOGIN_ID`) and a mismatch is
+  flagged and alerted. Things that cannot run (a flat-layout `run.py`, an account without a complete env file)
+  are listed as problems.
 - **Multi-trader (§16)** — one runner row (`<strategy>-multi`), stopped as a unit, with
   **runner-level liveness**: one wedge clock per logical system, each judged at its own cadence
   (the row wedges if any leg is stale; the fleet view shows the stalest leg's bar-age).
 - **Singleton** — a deployment-specific Windows named mutex (state-dir-hashed, OS-freed on exit, no
   stale-pidfile race); the pidfile remains for observability / the non-Windows guard.
-- **TUI** — btop-style boxed panels: fleet grouped by terminal, per-row + bulk control, a live
+- **TUI** — btop-style boxed panels: fleet grouped by account, per-row + bulk control (whole box or the
+  selected account), a live
   settings screen, and a per-system **details page** (status panel + live `z_system_log` and
   per-symbol inference tails, the inference tabbed by symbol) with start/stop/restart/kill in place.
-  Every destructive action — single/bulk **stop** and **restart**, the operator **force-kill** (`K`),
-  and **quitting** the TUI — is behind a y/n confirm, so an errant keystroke can't fire it (start is
-  additive, so it isn't gated).
+  Every consequential action — single/bulk **start**, **stop** and **restart**, the operator
+  **force-kill** (`K`), decommission and **quitting** the TUI — is behind a y/n confirm, so an errant
+  keystroke can't fire it.
 - **Force-kill (`K`)** — an operator escalation that `TerminateProcess`es a live PID immediately,
   bypassing the graceful Ctrl+C path (use when a graceful stop won't take). Because graceful shutdown
   never runs, the system lands in `orphan_suspected` and the broker session must be verified by hand.
 - **Broker-session start gate (§13/§14) — scaffold** — the engine refuses to start/restart a system
-  whose broker session is `red`, and the fleet view shows per-terminal session health. Resolution is
+  whose broker session is `red`, and the fleet view shows per-account session health. It also refuses a
+  start whose account env file is missing or lacks a session key (`TERMINAL_PATH`, `LOGIN_ID`,
+  `LOGIN_SERVER`), naming what is missing. Resolution is
   pluggable (`internal/session`): a per-broker `Adapter` (the real MT5/IB probe, not yet built) with a
   file-backed operator override (`session_health.json`) as the stand-in + maintenance lockout. With no
   adapter/override, sessions are `unknown` and the gate allows (absence of a probe never blocks).
 - **Import / decommission** — operator-driven, engine-independent (`internal/importsys`): the TUI `i`
-  dialog validates a source artefact dir, archives any existing copy, and installs it into `LIVE_BASE`
-  via a staged atomic rename (the engine re-discovers it read-only next tick); `D` decommission is the
-  inverse (archive + drop from the fleet, refused while the system runs). Both the import dialog (its
+  dialog picks an account, validates a source artefact dir, archives any existing copy, and installs it
+  into `LIVE_BASE\<account>` via a staged atomic rename (the engine re-discovers it read-only next tick);
+  `D` decommission is the inverse (archive + drop from the fleet, refused while the system runs, and only for
+  a system the engine discovers). The Account Admin (`_account_admin`) is protected: an import keeps its
+  directive, state and requests, and decommission is refused. Both the import dialog (its
   own view + key handler) and the `D` confirm are wired into the TUI and covered by regression tests.
-- **Env passthrough** — the engine spawns each `run.py` inheriting `OKMICH_QUANT_ENV_DIR`, so the
-  system resolves its own broker `.env` from that root with no flags. The trading systems' `run.py`
-  default `--env-file` now resolves against `OKMICH_QUANT_ENV_DIR` (falling back to the artefact dir
-  only when the var is unset), so a Supervisor-spawned (argument-less) launch and a manual launch agree.
+- **Account passthrough** — the engine spawns each `run.py` with its own environment plus
+  `OKMICH_QUANT_ACCOUNT=<account>` from the system's account folder; the system loads
+  `OKMICH_QUANT_ENV_DIR\.env.<account>` and logs under `LOG_BASE\<account>`. A manual launch sets the
+  variable by hand. `OKMICH_QUANT_ACCOUNT` is never set machine-wide.
+- **Migration** — `supervisor migrate-layout` moves a flat box into the account layout once (dry run by
+  default; `--apply` refuses while anything runs and proves every move before the first).
 
 **Deferred:**
 
-- Real MT5/IB session **probe** adapters + the stopped-system→session mapping (the `Adapter`
-  drop-in); real MT5 end-to-end validation (stand-ins prove the mechanism + engine logic).
+- Real MT5/IB session **probe** adapters (the `Adapter` drop-in; the account folder already maps a stopped
+  system to its terminal); real MT5 end-to-end validation (stand-ins prove the mechanism + engine logic).

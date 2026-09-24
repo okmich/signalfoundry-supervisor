@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/okmich/signalfoundry-supervisor/internal/accounts"
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
 	"github.com/okmich/signalfoundry-supervisor/internal/discovery"
 	"github.com/okmich/signalfoundry-supervisor/internal/ipc"
@@ -65,9 +66,10 @@ func TestIsFXWeekend(t *testing.T) {
 func testEngine(t *testing.T) *engine {
 	dir := t.TempDir()
 	return &engine{
-		cfg:         config.Config{WedgeMultiple: 3, WedgeGrace: time.Minute, StateDir: dir}, // M5 threshold = 16m
+		cfg:         config.Config{WedgeMultiple: 3, WedgeGrace: time.Minute, StateDir: dir, EnvDir: dir}, // M5 threshold = 16m
 		transitions: map[string]*transition{},
 		wedged:      map[string]bool{},
+		mismatched:  map[string]string{},
 		identities:  map[string]identity{},
 		notifier:    notify.FromEnvFile(""), // no creds -> alert is a no-op
 		sessions:    session.NewChecker(dir),
@@ -78,7 +80,7 @@ func testEngine(t *testing.T) *engine {
 // the session is unknown/unprobed (absence of a probe never blocks).
 func TestDoStartGatedOnSessionHealth(t *testing.T) {
 	e := testEngine(t)
-	s := &ipc.System{SystemID: "x/Y/M5", State: ipc.StateStopped, Broker: "deriv", Account: "DEMO-1", SessionID: "mt5-deriv-1"}
+	s := &ipc.System{SystemID: "x/Y/M5", State: ipc.StateStopped, Broker: "deriv", AccountID: "DEMO-1", SessionID: "mt5-deriv-1"}
 
 	// Unknown/unprobed session: the gate allows (no probe should never block).
 	if msg, ok := e.sessionGate(s); !ok {
@@ -290,32 +292,74 @@ func TestIdentityPersistsAndReattaches(t *testing.T) {
 	}
 }
 
-func TestGroupTerminals(t *testing.T) {
+// Grouping is by account folder, stopped systems included; the cap and leg counts cover live systems only.
+func TestGroupAccounts(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env.fxify.demo"), []byte("LOGIN_ID=42\nLOGIN_SERVER=FXIFY-Demo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	systems := []ipc.System{
-		{SystemID: "a/X/5", State: ipc.StateRunning, SessionID: "mt5-1", Account: "A1"},
-		{SystemID: "b-multi", State: ipc.StateRunning, SessionID: "mt5-1", Account: "A1", Multi: true, Symbols: []string{"s1", "s2", "s3"}},
-		{SystemID: "c/Y/5", State: ipc.StateRunning, SessionID: "mt5-2", Account: "A2"},
-		{SystemID: "d/Z/5", State: ipc.StateStopped}, // no session -> not grouped, sorts last
+		{SystemID: "icmarkets.demo/c/Y/5", Account: "icmarkets.demo", State: ipc.StateStopped},
+		{SystemID: "fxify.demo/b-multi", Account: "fxify.demo", State: ipc.StateRunning, SessionID: "mt5-1", Broker: "FXIFY-Demo", Multi: true, Symbols: []string{"s1", "s2", "s3"}},
+		{SystemID: "fxify.demo/a/X/5", Account: "fxify.demo", State: ipc.StateRunning, SessionID: "mt5-1"},
+		{SystemID: "fxify.demo/d/Z/5", Account: "fxify.demo", State: ipc.StateStoppedByOp, SessionID: "mt5-old"},
 	}
-	terms := groupTerminals(systems)
-	byID := map[string]ipc.Terminal{}
-	for _, tm := range terms {
-		byID[tm.BrokerSessionID] = tm
+	accts := groupAccounts(systems, accounts.NewCache(dir))
+	if len(accts) != 2 || accts[0].Name != "fxify.demo" || accts[1].Name != "icmarkets.demo" {
+		t.Fatalf("accounts = %+v, want fxify.demo then icmarkets.demo", accts)
 	}
-	if len(terms) != 2 {
-		t.Fatalf("got %d terminals, want 2 (the stopped system has no session)", len(terms))
+	fx, ic := accts[0], accts[1]
+	if fx.Login != "42" || fx.Server != "FXIFY-Demo" || fx.EnvMissing {
+		t.Errorf("fxify.demo identity = %+v", fx)
 	}
-	if got := byID["mt5-1"].LogicalSystems; got != 2 { // 1 single + 1 multi = 2 PIDs = 2 terminal IPC slots
-		t.Errorf("mt5-1 logical systems = %d, want 2 (a multi-trader is ONE logical system, not len(symbols))", got)
+	if fx.LogicalSystems != 2 { // 1 single + 1 multi = 2 PIDs = 2 terminal IPC slots; the stopped one is not counted
+		t.Errorf("logical systems = %d, want 2 (a multi-trader is ONE logical system, stopped systems don't count)", fx.LogicalSystems)
 	}
-	if got := byID["mt5-1"].Legs; got != 4 { // 1 + a 3-symbol multi — concentration, reported but not capped
-		t.Errorf("mt5-1 legs = %d, want 4 (1 single + 3 multi symbols)", got)
+	if fx.Legs != 4 { // 1 + a 3-symbol multi — concentration, reported but not capped
+		t.Errorf("legs = %d, want 4", fx.Legs)
 	}
-	if got := byID["mt5-2"].LogicalSystems; got != 1 {
-		t.Errorf("mt5-2 logical systems = %d, want 1", got)
+	if fx.BrokerSessionID != "mt5-1" || len(fx.SystemIDs) != 3 {
+		t.Errorf("fxify.demo = %+v", fx)
 	}
-	if systems[len(systems)-1].SystemID != "d/Z/5" {
-		t.Errorf("the idle (no-session) system should sort last, ended with %s", systems[len(systems)-1].SystemID)
+	if !ic.EnvMissing || ic.LogicalSystems != 0 || len(ic.SystemIDs) != 1 {
+		t.Errorf("icmarkets.demo (stopped, no env file) = %+v", ic)
+	}
+	if systems[0].SystemID != "fxify.demo/a/X/5" || systems[3].SystemID != "icmarkets.demo/c/Y/5" {
+		t.Errorf("systems should be ordered by account then id, got %v", []string{systems[0].SystemID, systems[1].SystemID, systems[2].SystemID, systems[3].SystemID})
+	}
+}
+
+// A start is refused when the account has no broker env file, and launch refuses a system outside an
+// account folder, so a runner is never spawned without OKMICH_QUANT_ACCOUNT.
+func TestStartGatedOnAccountEnv(t *testing.T) {
+	e := testEngine(t)
+	s := &ipc.System{SystemID: "deriv.live/x/Y/5", Account: "deriv.live", State: ipc.StateStopped}
+	res := e.doStart(ipc.Command{ID: "c1", SystemID: s.SystemID}, s, discovery.System{Account: "deriv.live", RunPy: "run.py"})
+	if res.Accepted || !strings.Contains(res.Error, "no broker env file") {
+		t.Errorf("missing env should refuse the start, got accepted=%v err=%q", res.Accepted, res.Error)
+	}
+	if _, err := e.launch("", "run.py"); err == nil {
+		t.Errorf("launch without an account must fail")
+	}
+}
+
+// An account mismatch alerts once per episode and clears when resolved or when the system goes away.
+func TestCheckAccountsEdge(t *testing.T) {
+	e := testEngine(t)
+	sys := []ipc.System{{SystemID: "fxify.demo/a", AccountMismatch: "terminal is logged into 7"}}
+	e.checkAccounts(sys)
+	if e.mismatched["fxify.demo/a"] == "" {
+		t.Fatal("mismatch should be recorded")
+	}
+	sys[0].AccountMismatch = ""
+	e.checkAccounts(sys)
+	if _, ok := e.mismatched["fxify.demo/a"]; ok {
+		t.Error("cleared mismatch should be forgotten")
+	}
+	e.mismatched["gone"] = "x"
+	e.checkAccounts(sys)
+	if _, ok := e.mismatched["gone"]; ok {
+		t.Error("a vanished system's mismatch should be forgotten")
 	}
 }
 

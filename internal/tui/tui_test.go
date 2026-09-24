@@ -25,25 +25,29 @@ func TestViewRendersFleet(t *testing.T) {
 		fleet: ipc.FleetState{
 			Engine:    ipc.EngineInfo{PID: 31576, Alerts: true},
 			UpdatedAt: time.Date(2026, 6, 3, 18, 42, 39, 0, time.UTC),
-			Terminals: []ipc.Terminal{
-				{BrokerSessionID: "mt5-deriv-1", Account: "DEMO-123", LogicalSystems: 2,
-					SystemIDs: []string{"rsi2_mean_reversion/EURUSD/M5", "keras_direction/XAUUSD/H1"}},
+			Accounts: []ipc.Account{
+				{Name: "deriv.demo", Login: "DEMO-123", Server: "Deriv-Demo", LogicalSystems: 2, BrokerSessionID: "mt5-deriv-1",
+					SystemIDs: []string{"deriv.demo/keras_direction/XAUUSD/H1", "deriv.demo/rsi2_mean_reversion/EURUSD/M5"}},
+				{Name: "fxify.demo", EnvMissing: true, SystemIDs: []string{"fxify.demo/hmm_neutral/GBPUSD/M15"}},
 			},
-			// systems arrive ordered by terminal (engine sorts); idle/non-running last
+			// systems arrive ordered by account (engine sorts), stopped ones included
 			Systems: []ipc.System{
-				{SystemID: "rsi2_mean_reversion/EURUSD/M5", State: ipc.StateRunning, PID: 48748, LastBarAgeS: 2, SessionID: "mt5-deriv-1", Account: "DEMO-123"},
-				{SystemID: "keras_direction/XAUUSD/H1", State: ipc.StateRunning, PID: 12044, LastBarAgeS: 312, Wedged: true, SessionID: "mt5-deriv-1", Account: "DEMO-123"},
-				{SystemID: "hmm_neutral/GBPUSD/M15", State: ipc.StateStoppedByOp},
-				{SystemID: "rsi2_mean_reversion/USDJPY/M5", State: ipc.StateOrphanSuspected, PID: 5512},
+				{SystemID: "deriv.demo/keras_direction/XAUUSD/H1", Account: "deriv.demo", State: ipc.StateRunning, PID: 12044, LastBarAgeS: 312, Wedged: true, SessionID: "mt5-deriv-1", AccountID: "DEMO-123"},
+				{SystemID: "deriv.demo/rsi2_mean_reversion/EURUSD/M5", Account: "deriv.demo", State: ipc.StateRunning, PID: 48748, LastBarAgeS: 2, SessionID: "mt5-deriv-1", AccountID: "DEMO-123",
+					AccountMismatch: "terminal is logged into 7"},
+				{SystemID: "deriv.demo/rsi2_mean_reversion/USDJPY/M5", Account: "deriv.demo", State: ipc.StateOrphanSuspected, PID: 5512},
+				{SystemID: "fxify.demo/hmm_neutral/GBPUSD/M15", Account: "fxify.demo", State: ipc.StateStoppedByOp},
 			},
+			Problems: []ipc.Problem{{Path: "ctlpb_raw-multi", Reason: "not in an account folder"}},
 		},
-		status: "rsi2_mean_reversion/EURUSD/M5 → stopping",
+		status: "deriv.demo/rsi2_mean_reversion/EURUSD/M5 → stopping",
 	}
 	out := m.View()
 	for _, want := range []string{
 		"SYSTEM", "STATE", "BAR AGE",
-		"terminal mt5-deriv-1", "DEMO-123", "2/10 systems", "not running", // blast-radius grouping
-		"rsi2_mean_reversion/EURUSD/M5", "WEDGED", "Stopped(op)", "Orphan?", "alerts",
+		"deriv.demo · DEMO-123 @ Deriv-Demo", "2/10 systems", "fxify.demo", "no .env.fxify.demo", // account grouping
+		"rsi2_mean_reversion/EURUSD/M5", "WEDGED", "⚠ ACCOUNT", "Stopped(op)", "Orphan?", "alerts",
+		"ctlpb_raw-multi", "2 accounts",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered view is missing %q", want)
@@ -152,7 +156,7 @@ func TestOpenDetailPicksStalestTab(t *testing.T) {
 	m.fleet.Systems[0].Wedged = true
 	m.fleet.Systems[0].Legs[1].Wedged = true
 	m.fleet.Systems[0].StartedAt = time.Date(2026, 6, 4, 9, 0, 0, 0, time.UTC)
-	m.fleet.Systems[0].Broker, m.fleet.Systems[0].Account, m.fleet.Systems[0].SessionID = "deriv", "DEMO-123", "mt5-deriv-1"
+	m.fleet.Systems[0].Broker, m.fleet.Systems[0].AccountID, m.fleet.Systems[0].SessionID = "deriv", "DEMO-123", "mt5-deriv-1"
 	m.infPane.lines = []string{`{"event":"breaker","reason":"stale_feed"}`, `{"event":"bar","close":1.2701}`}
 	m.sysPane.lines = []string{"12:00:01 INFO  bar GBPUSD 1.2701", "12:05:02 WARN  broker latency 800ms"}
 	t.Log("\n" + m.detailView())
@@ -230,9 +234,9 @@ func TestFleetViewShowsSessionHealth(t *testing.T) {
 	m := model{
 		cfg: config.Config{StateDir: t.TempDir()}, pending: map[string]pendingCmd{}, width: 100,
 		fleet: ipc.FleetState{
-			Terminals: []ipc.Terminal{{BrokerSessionID: "mt5-deriv-1", Account: "DEMO-1", LogicalSystems: 1, Health: "red"}},
+			Accounts: []ipc.Account{{Name: "deriv.demo", BrokerSessionID: "mt5-deriv-1", Login: "DEMO-1", LogicalSystems: 1, Health: "red"}},
 			Systems: []ipc.System{
-				{SystemID: "rsi2/EURUSD/M5", State: ipc.StateRunning, PID: 1, SessionID: "mt5-deriv-1", Account: "DEMO-1"},
+				{SystemID: "deriv.demo/rsi2/EURUSD/M5", Account: "deriv.demo", State: ipc.StateRunning, PID: 1, SessionID: "mt5-deriv-1", AccountID: "DEMO-1"},
 			},
 		},
 	}
@@ -248,9 +252,9 @@ func TestFleetViewCountsMultiTraderAsOneSystem(t *testing.T) {
 		cfg: config.Config{StateDir: t.TempDir()}, pending: map[string]pendingCmd{}, width: 100,
 		fleet: ipc.FleetState{
 			// the operator's case: 3 runners carrying 3 + 4 + 4 symbols on one account
-			Terminals: []ipc.Terminal{{BrokerSessionID: "mt5-deriv-1", Account: "DEMO-1", LogicalSystems: 3, Legs: 11}},
+			Accounts: []ipc.Account{{Name: "deriv.demo", BrokerSessionID: "mt5-deriv-1", Login: "DEMO-1", LogicalSystems: 3, Legs: 11}},
 			Systems: []ipc.System{
-				{SystemID: "a-multi", State: ipc.StateRunning, PID: 1, SessionID: "mt5-deriv-1", Account: "DEMO-1",
+				{SystemID: "deriv.demo/a-multi", Account: "deriv.demo", State: ipc.StateRunning, PID: 1, SessionID: "mt5-deriv-1", AccountID: "DEMO-1",
 					Multi: true, Symbols: []string{"s1", "s2", "s3"}},
 			},
 		},
@@ -403,8 +407,8 @@ func testModel(t *testing.T) model {
 // D decommissions a stopped system: confirm, then its LIVE_BASE artefact is archived & removed.
 func TestDecommissionGatedAndArchives(t *testing.T) {
 	dir := t.TempDir()
-	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state")}
-	sysDir := filepath.Join(cfg.LiveBase, "s", "EURUSD", "15")
+	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state"), EnvDir: envDirWith(t, "fxify.demo")}
+	sysDir := filepath.Join(cfg.LiveBase, "fxify.demo", "s", "EURUSD", "15")
 	if err := os.MkdirAll(sysDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -412,12 +416,12 @@ func TestDecommissionGatedAndArchives(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := model{cfg: cfg, pending: map[string]pendingCmd{}, awaiting: map[string]awaitStart{},
-		fleet: ipc.FleetState{Systems: []ipc.System{{SystemID: "s/EURUSD/15", State: ipc.StateStopped}}}}
+		fleet: ipc.FleetState{Systems: []ipc.System{{SystemID: "fxify.demo/s/EURUSD/15", Account: "fxify.demo", State: ipc.StateStopped}}}}
 	m.cursor = 0
 
 	armed, _ := m.handleKey(key("D"))
 	mm := armed.(model)
-	if mm.confirm == nil || mm.confirm.action != "decommission" || mm.confirm.systemID != "s/EURUSD/15" {
+	if mm.confirm == nil || mm.confirm.action != "decommission" || mm.confirm.systemID != "fxify.demo/s/EURUSD/15" {
 		t.Fatalf("D should arm a decommission confirm, got %+v", mm.confirm)
 	}
 	confirmed, _ := mm.handleKey(key("y"))
@@ -433,7 +437,7 @@ func TestDecommissionGatedAndArchives(t *testing.T) {
 // The import dialog ('i') must render and capture input. Regression: the dialog was unwired — 'i' set
 // importState with no View case and no key handler, so it silently did nothing on screen.
 func TestImportDialogWiring(t *testing.T) {
-	m := model{cfg: config.Config{StateDir: t.TempDir(), LiveBase: t.TempDir()}, pending: map[string]pendingCmd{}, width: 92}
+	m := model{cfg: config.Config{StateDir: t.TempDir(), LiveBase: t.TempDir(), EnvDir: envDirWith(t, "fxify.demo")}, pending: map[string]pendingCmd{}, width: 92}
 	press := func(k tea.KeyMsg) { tm, _ := m.handleKey(k); m = tm.(model) }
 
 	press(key("i"))
@@ -475,7 +479,7 @@ func TestImportDialogWiring(t *testing.T) {
 // system id) → y installs it into LIVE_BASE via importsys.
 func TestImportInstallsValidatedSystem(t *testing.T) {
 	dir := t.TempDir()
-	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state")}
+	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state"), EnvDir: envDirWith(t, "fxify.demo")}
 	src := filepath.Join(dir, "incoming", "rsi2")
 	if err := os.MkdirAll(src, 0o755); err != nil {
 		t.Fatal(err)
@@ -496,10 +500,10 @@ func TestImportInstallsValidatedSystem(t *testing.T) {
 	if m.importing == nil || m.importing.plan == nil {
 		t.Fatalf("a valid source should validate into a plan, got %+v", m.importing)
 	}
-	if m.importing.plan.SystemID != "rsi2/EURUSD/5" {
-		t.Fatalf("plan system id = %q, want rsi2/EURUSD/5", m.importing.plan.SystemID)
+	if m.importing.plan.SystemID != "fxify.demo/rsi2/EURUSD/5" {
+		t.Fatalf("plan system id = %q, want fxify.demo/rsi2/EURUSD/5", m.importing.plan.SystemID)
 	}
-	if out := m.View(); !strings.Contains(out, "rsi2/EURUSD/5") || !strings.Contains(out, "install") {
+	if out := m.View(); !strings.Contains(out, "fxify.demo/rsi2/EURUSD/5") || !strings.Contains(out, "install") {
 		t.Fatalf("confirm view should show the system id and an install hint:\n%s", out)
 	}
 
@@ -507,10 +511,10 @@ func TestImportInstallsValidatedSystem(t *testing.T) {
 	if m.importing != nil {
 		t.Error("dialog should close after a successful install")
 	}
-	if !strings.Contains(m.status, "imported rsi2/EURUSD/5") {
+	if !strings.Contains(m.status, "imported fxify.demo/rsi2/EURUSD/5") {
 		t.Errorf("status = %q, want an imported result", m.status)
 	}
-	if _, err := os.Stat(filepath.Join(cfg.LiveBase, "rsi2", "EURUSD", "5", "run.py")); err != nil {
+	if _, err := os.Stat(filepath.Join(cfg.LiveBase, "fxify.demo", "rsi2", "EURUSD", "5", "run.py")); err != nil {
 		t.Errorf("run.py should be installed under LIVE_BASE: %v", err)
 	}
 }
@@ -519,7 +523,7 @@ func TestImportInstallsValidatedSystem(t *testing.T) {
 // path: the dialog strips control runes so filepath.Abs resolves instead of failing "invalid argument".
 func TestImportStripsControlRunesFromPaste(t *testing.T) {
 	dir := t.TempDir()
-	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state")}
+	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state"), EnvDir: envDirWith(t, "fxify.demo")}
 	src := filepath.Join(dir, "incoming", "rsi2")
 	if err := os.MkdirAll(src, 0o755); err != nil {
 		t.Fatal(err)
@@ -537,7 +541,7 @@ func TestImportStripsControlRunesFromPaste(t *testing.T) {
 	for _, r := range src {
 		pasted = append(pasted, r, '\x00')
 	}
-	m := model{cfg: cfg, importing: &importState{}, pending: map[string]pendingCmd{}, width: 92}
+	m := model{cfg: cfg, importing: &importState{accounts: []string{"fxify.demo"}}, pending: map[string]pendingCmd{}, width: 92}
 	press := func(k tea.KeyMsg) { tm, _ := m.handleKey(k); m = tm.(model) }
 
 	press(tea.KeyMsg{Type: tea.KeyRunes, Runes: pasted})
@@ -748,5 +752,57 @@ func TestTailFileSanitizesInvalidUTF8(t *testing.T) {
 	}
 	if len(got) != 1 || !utf8.ValidString(got[0]) {
 		t.Fatalf("tailFile must return valid UTF-8, got %q", got)
+	}
+}
+
+// envDirWith returns an ENV_DIR holding a .env.<account> file for each account.
+func envDirWith(t *testing.T, accts ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, a := range accts {
+		if err := os.WriteFile(filepath.Join(dir, ".env."+a), []byte("LOGIN_ID=1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// The import dialog lists the box's accounts; tab / shift+tab choose the target, and the plan installs
+// into that account's folder.
+func TestImportChoosesAccount(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state"), EnvDir: envDirWith(t, "fxify.demo", "icmarkets.demo")}
+	src := filepath.Join(dir, "incoming", "rsi2")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(src, "run.py"), []byte("# run"), 0o644)
+	_ = os.WriteFile(filepath.Join(src, "config.json"), []byte(`{"strategy":{"name":"rsi2","symbol":"EURUSD","timeframe":5}}`), 0o644)
+	m := model{cfg: cfg, pending: map[string]pendingCmd{}, width: 92}
+	press := func(k tea.KeyMsg) { tm, _ := m.handleKey(k); m = tm.(model) }
+
+	press(key("i"))
+	if out := m.View(); !strings.Contains(out, "fxify.demo") || !strings.Contains(out, "1/2") {
+		t.Fatalf("the dialog should show the first account:\n%s", out)
+	}
+	press(tea.KeyMsg{Type: tea.KeyTab})
+	press(tea.KeyMsg{Type: tea.KeyTab})
+	press(tea.KeyMsg{Type: tea.KeyShiftTab}) // wraps forward twice then back once -> icmarkets.demo
+	press(key(src))
+	press(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.importing == nil || m.importing.plan == nil || m.importing.plan.SystemID != "icmarkets.demo/rsi2/EURUSD/5" {
+		t.Fatalf("plan should target icmarkets.demo, got %+v", m.importing)
+	}
+}
+
+// With no .env.<account> files there is nothing to import into; Enter says so instead of validating.
+func TestImportWithoutAccounts(t *testing.T) {
+	m := model{cfg: config.Config{StateDir: t.TempDir(), LiveBase: t.TempDir(), EnvDir: t.TempDir()}, pending: map[string]pendingCmd{}, width: 92}
+	press := func(k tea.KeyMsg) { tm, _ := m.handleKey(k); m = tm.(model) }
+	press(key("i"))
+	press(key("C:/x"))
+	press(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.importing == nil || !strings.Contains(m.importing.errText, "no accounts") {
+		t.Fatalf("want a no-accounts error, got %+v", m.importing)
 	}
 }

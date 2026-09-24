@@ -20,6 +20,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/okmich/signalfoundry-supervisor/internal/accounts"
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
 	"github.com/okmich/signalfoundry-supervisor/internal/proc"
 	"github.com/okmich/signalfoundry-supervisor/internal/registry"
@@ -41,13 +42,14 @@ var reservedPathChars = regexp.MustCompile(`[<>:"|?*\x00-\x1f]`)
 // renders it for confirmation before anything is written.
 type Plan struct {
 	SourceDir   string
+	Account     string // the account folder it is installed into (<broker>.<env>)
 	Multi       bool
 	Strategy    string   // strategy code (the path label)
 	Symbol      string   // single-trader only
 	Symbols     []string // multi-trader only
 	Timeframe   int      // single-trader only
 	SystemID    string   // matches discovery's system_id exactly
-	TargetDir   string   // absolute destination under LIVE_BASE
+	TargetDir   string   // absolute destination: LIVE_BASE/<account>/...
 	WillArchive bool     // target already exists -> the current copy is archived first
 }
 
@@ -63,10 +65,19 @@ type sysConfig struct {
 	Strategies []strategyEntry `json:"strategies"`
 }
 
-// BuildPlan validates the source directory and resolves the canonical LIVE_BASE target. It returns a
-// descriptive error (never panics) for any non-conforming input, and refuses if the resolved system
-// is currently running — an artefact must not be swapped under a live PID.
-func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
+// BuildPlan validates the source directory and resolves the canonical target under the account folder,
+// LIVE_BASE/<account>/... The account must have a broker env file (.env.<account> in ENV_DIR): the
+// folder decides which account the system trades, so an import into an account the box cannot log into
+// is refused here rather than at first start. It returns a descriptive error (never panics) for any
+// non-conforming input, and refuses if the resolved system is currently running — an artefact must not
+// be swapped under a live PID.
+func BuildPlan(cfg config.Config, account, sourceDir string) (Plan, error) {
+	if !accounts.Valid(account) {
+		return Plan{}, fmt.Errorf("account %q is not an env-file stem <broker>.<env> (e.g. fxify.demo)", account)
+	}
+	if info := accounts.Load(cfg.EnvDir, account); !info.EnvFound {
+		return Plan{}, fmt.Errorf("no broker env file for account %s (%s)", account, info.EnvFile)
+	}
 	// Strip control/NUL runes first: a clipboard paste can interleave \x00 bytes (a mis-decoded UTF-16
 	// path), which would otherwise reach filepath.Abs below and fail with an opaque "invalid argument".
 	src := strings.Map(func(r rune) rune {
@@ -107,7 +118,7 @@ func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
 		return Plan{}, fmt.Errorf("config.json is not valid JSON: %w", err)
 	}
 
-	p := Plan{SourceDir: src}
+	p := Plan{SourceDir: src, Account: account}
 	switch {
 	case len(sc.Strategies) > 0: // multi-trader (mirrors discovery's classification)
 		first := sc.Strategies[0]
@@ -124,8 +135,8 @@ func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
 			p.Symbols = append(p.Symbols, s.Symbol)
 		}
 		root := runnerStrategyRoot(first.Name)
-		p.Multi, p.Strategy, p.SystemID = true, first.Name, root
-		p.TargetDir = filepath.Join(cfg.LiveBase, root)
+		p.Multi, p.Strategy, p.SystemID = true, first.Name, account+"/"+root
+		p.TargetDir = filepath.Join(cfg.LiveBase, account, root)
 	case sc.Strategy != nil: // single-trader
 		s := sc.Strategy
 		if err := validateToken("strategy", s.Name); err != nil {
@@ -139,8 +150,8 @@ func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
 		}
 		strat, sym, tf := pathSafe(s.Name), pathSafe(s.Symbol), strconv.Itoa(s.Timeframe)
 		p.Strategy, p.Symbol, p.Timeframe = s.Name, s.Symbol, s.Timeframe
-		p.SystemID = strat + "/" + sym + "/" + tf
-		p.TargetDir = filepath.Join(cfg.LiveBase, strat, sym, tf)
+		p.SystemID = account + "/" + strat + "/" + sym + "/" + tf
+		p.TargetDir = filepath.Join(cfg.LiveBase, account, strat, sym, tf)
 	default:
 		return Plan{}, fmt.Errorf("config.json classifies as neither single (a `strategy` object) nor multi (a non-empty `strategies[]`)")
 	}
@@ -201,11 +212,15 @@ func (p Plan) Apply(cfg config.Config) (archivedTo string, err error) {
 // Decommission retires an installed system: it archives the system's LIVE_BASE artefact dir to
 // .archive (the inverse of an import) so discovery drops it from the fleet, and is reversible. It
 // refuses if the system is running. Returns the archive location. The system_id is the relative path
-// under LIVE_BASE for both a single-trader (<strategy>/<symbol>/<timeframe>) and a multi-trader
-// (<strategy>-multi), so it maps straight to the artefact dir.
+// under LIVE_BASE for both a single-trader (<account>/<strategy>/<symbol>/<timeframe>) and a multi-trader
+// (<account>/<strategy>-multi), so it maps straight to the artefact dir. An id that names a whole account
+// folder, or anything outside one, is refused.
 func Decommission(cfg config.Config, systemID string) (archivedTo string, err error) {
 	if strings.TrimSpace(systemID) == "" {
 		return "", fmt.Errorf("no system id given")
+	}
+	if acct, rest, ok := strings.Cut(systemID, "/"); !ok || !accounts.Valid(acct) || strings.TrimSpace(rest) == "" {
+		return "", fmt.Errorf("invalid system id %q (expected <account>/<system>)", systemID)
 	}
 	if err := ensureNotRunning(cfg, systemID); err != nil {
 		return "", err

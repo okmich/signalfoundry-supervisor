@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // CtrlCMain is the `supervisor ctrlc --pid N` helper: it borrows the target's console and fires
@@ -45,4 +46,24 @@ func Stop(pid int) error {
 		return fmt.Errorf("ctrlc helper failed: %v: %s", err, out)
 	}
 	return nil
+}
+
+// MergeEnv returns base with each KEY=VALUE in overrides applied: a same-named base entry (compared
+// case-insensitively, as Windows does) is dropped and the override appended. Entries without '=' (and
+// Windows' hidden "=C:=..." drive entries, whose key is empty) are kept as-is.
+func MergeEnv(base, overrides []string) []string {
+	keys := map[string]bool{}
+	for _, kv := range overrides {
+		if k, _, ok := strings.Cut(kv, "="); ok && k != "" {
+			keys[strings.ToUpper(k)] = true
+		}
+	}
+	out := make([]string, 0, len(base)+len(overrides))
+	for _, kv := range base {
+		if k, _, ok := strings.Cut(kv, "="); ok && keys[strings.ToUpper(k)] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, overrides...)
 }

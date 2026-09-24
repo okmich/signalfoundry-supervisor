@@ -17,9 +17,10 @@ func SendCtrlC(pid uint32) error {
 	return errors.New("SendCtrlC: console Ctrl+C control is only implemented on Windows")
 }
 
-func Spawn(python, runPy string, args ...string) (int, error) {
+func Spawn(python, runPy string, env []string, args ...string) (int, error) {
 	cmd := exec.Command(python, append([]string{runPy}, args...)...)
 	cmd.Dir = filepath.Dir(runPy)
+	cmd.Env = MergeEnv(os.Environ(), env)
 	if err := cmd.Start(); err != nil {
 		return 0, err
 	}

@@ -1,4 +1,4 @@
-// Package contract is the read-side of LOGGING_CONTRACT v1.1.0 — the supervisor's ONLY
+// Package contract is the read-side of LOGGING_CONTRACT v2.0.0 — the supervisor's ONLY
 // structural dependency on the trading systems. It reads the runner-root status.json and the
 // inference JSONL; it never imports the Python framework.
 package contract
@@ -19,6 +19,7 @@ type RunnerStatus struct {
 	RunnerID           string          `json:"runner_id"`
 	RunnerStartToken   string          `json:"runner_start_token"`
 	PID                int             `json:"pid"`
+	Account            string          `json:"account"` // v2.0.0: the account folder it logged under ("" from a v1 runner)
 	Broker             string          `json:"broker"`
 	AccountID          string          `json:"account_id"`
 	BrokerSessionID    string          `json:"broker_session_id"`
@@ -36,15 +37,15 @@ type LogicalSystem struct {
 	Timeframe       int    `json:"timeframe"`
 }
 
-// StatusPath is the runner-root status file: <logBase>/<runnerStrategy>/status.json, where
+// StatusPath is the runner-root status file: <logBase>/<account>/<runnerStrategy>/status.json, where
 // runnerStrategy is <strategy> (single trader) or <strategy>-multi (multi-trader).
-func StatusPath(logBase, runnerStrategy string) string {
-	return filepath.Join(logBase, runnerStrategy, "status.json")
+func StatusPath(logBase, account, runnerStrategy string) string {
+	return filepath.Join(logBase, account, runnerStrategy, "status.json")
 }
 
-// InferenceDir is <logBase>/<runnerStrategy>/<symbol>/<timeframe>/inference.
-func InferenceDir(logBase, runnerStrategy, symbol, timeframe string) string {
-	return filepath.Join(logBase, runnerStrategy, symbol, timeframe, "inference")
+// InferenceDir is <logBase>/<account>/<runnerStrategy>/<symbol>/<timeframe>/inference.
+func InferenceDir(logBase, account, runnerStrategy, symbol, timeframe string) string {
+	return filepath.Join(logBase, account, runnerStrategy, symbol, timeframe, "inference")
 }
 
 // ReadStatus loads a runner-root status.json.

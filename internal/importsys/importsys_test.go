@@ -20,10 +20,15 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
+const acct = "fxify.demo"
+
+// testCfg is a box with one account, fxify.demo, that has a broker env file.
 func testCfg(t *testing.T) config.Config {
 	t.Helper()
 	dir := t.TempDir()
-	return config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state")}
+	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state"), EnvDir: filepath.Join(dir, "env")}
+	writeFile(t, filepath.Join(cfg.EnvDir, ".env."+acct), "LOGIN_ID=1\n")
+	return cfg
 }
 
 // srcWith writes a conforming source dir with the given config.json and returns its path.
@@ -39,7 +44,7 @@ func TestBuildPlanSingle(t *testing.T) {
 	cfg := testCfg(t)
 	src := srcWith(t, `{"name":"X","strategy":{"name":"rsi2_mean_reversion","symbol":"Volatility 100 Index","timeframe":5},"strategies":[]}`)
 
-	p, err := BuildPlan(cfg, src)
+	p, err := BuildPlan(cfg, acct, src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,10 +52,10 @@ func TestBuildPlanSingle(t *testing.T) {
 		t.Fatal("want single-trader")
 	}
 	// system_id and target use the framework's path labels (spaces preserved, timeframe int).
-	if p.SystemID != "rsi2_mean_reversion/Volatility 100 Index/5" {
+	if p.SystemID != "fxify.demo/rsi2_mean_reversion/Volatility 100 Index/5" || p.Account != acct {
 		t.Fatalf("system_id = %q", p.SystemID)
 	}
-	want := filepath.Join(cfg.LiveBase, "rsi2_mean_reversion", "Volatility 100 Index", "5")
+	want := filepath.Join(cfg.LiveBase, acct, "rsi2_mean_reversion", "Volatility 100 Index", "5")
 	if p.TargetDir != want {
 		t.Fatalf("target = %q, want %q", p.TargetDir, want)
 	}
@@ -60,17 +65,17 @@ func TestBuildPlanMulti(t *testing.T) {
 	cfg := testCfg(t)
 	src := srcWith(t, `{"name":"M","strategies":[{"name":"rsi2_mean_reversion","symbol":"BTCUSD","timeframe":5},{"name":"rsi2_mean_reversion","symbol":"Step Index","timeframe":5}]}`)
 
-	p, err := BuildPlan(cfg, src)
+	p, err := BuildPlan(cfg, acct, src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !p.Multi || p.SystemID != "rsi2_mean_reversion-multi" {
+	if !p.Multi || p.SystemID != "fxify.demo/rsi2_mean_reversion-multi" {
 		t.Fatalf("plan = %+v, want rsi2_mean_reversion-multi", p)
 	}
 	if len(p.Symbols) != 2 {
 		t.Fatalf("symbols = %v", p.Symbols)
 	}
-	want := filepath.Join(cfg.LiveBase, "rsi2_mean_reversion-multi")
+	want := filepath.Join(cfg.LiveBase, acct, "rsi2_mean_reversion-multi")
 	if p.TargetDir != want {
 		t.Fatalf("target = %q, want %q", p.TargetDir, want)
 	}
@@ -82,38 +87,38 @@ func TestBuildPlanValidationErrors(t *testing.T) {
 	t.Run("missing run.py", func(t *testing.T) {
 		src := filepath.Join(t.TempDir(), "s")
 		writeFile(t, filepath.Join(src, "config.json"), `{"strategy":{"name":"s","symbol":"EURUSD","timeframe":5}}`)
-		if _, err := BuildPlan(cfg, src); err == nil || !strings.Contains(err.Error(), "run.py") {
+		if _, err := BuildPlan(cfg, acct, src); err == nil || !strings.Contains(err.Error(), "run.py") {
 			t.Fatalf("want run.py error, got %v", err)
 		}
 	})
 	t.Run("missing config.json", func(t *testing.T) {
 		src := filepath.Join(t.TempDir(), "s")
 		writeFile(t, filepath.Join(src, "run.py"), "")
-		if _, err := BuildPlan(cfg, src); err == nil || !strings.Contains(err.Error(), "config.json") {
+		if _, err := BuildPlan(cfg, acct, src); err == nil || !strings.Contains(err.Error(), "config.json") {
 			t.Fatalf("want config.json error, got %v", err)
 		}
 	})
 	t.Run("bad json", func(t *testing.T) {
 		src := srcWith(t, `{not json`)
-		if _, err := BuildPlan(cfg, src); err == nil || !strings.Contains(err.Error(), "valid JSON") {
+		if _, err := BuildPlan(cfg, acct, src); err == nil || !strings.Contains(err.Error(), "valid JSON") {
 			t.Fatalf("want json error, got %v", err)
 		}
 	})
 	t.Run("neither single nor multi", func(t *testing.T) {
 		src := srcWith(t, `{"name":"x","strategies":[]}`)
-		if _, err := BuildPlan(cfg, src); err == nil || !strings.Contains(err.Error(), "neither") {
+		if _, err := BuildPlan(cfg, acct, src); err == nil || !strings.Contains(err.Error(), "neither") {
 			t.Fatalf("want classify error, got %v", err)
 		}
 	})
 	t.Run("reserved char in symbol", func(t *testing.T) {
 		src := srcWith(t, `{"strategy":{"name":"s","symbol":"EUR:USD","timeframe":5},"strategies":[]}`)
-		if _, err := BuildPlan(cfg, src); err == nil || !strings.Contains(err.Error(), "reserved") {
+		if _, err := BuildPlan(cfg, acct, src); err == nil || !strings.Contains(err.Error(), "reserved") {
 			t.Fatalf("want reserved-char error, got %v", err)
 		}
 	})
 	t.Run("non-positive timeframe", func(t *testing.T) {
 		src := srcWith(t, `{"strategy":{"name":"s","symbol":"EURUSD","timeframe":0},"strategies":[]}`)
-		if _, err := BuildPlan(cfg, src); err == nil || !strings.Contains(err.Error(), "timeframe") {
+		if _, err := BuildPlan(cfg, acct, src); err == nil || !strings.Contains(err.Error(), "timeframe") {
 			t.Fatalf("want timeframe error, got %v", err)
 		}
 	})
@@ -128,7 +133,7 @@ func TestApplyCopiesSkipsJunkAndArchives(t *testing.T) {
 	writeFile(t, filepath.Join(src, "__pycache__", "x.pyc"), "junk") // build noise
 	writeFile(t, filepath.Join(src, "z_system_log_123.log"), "junk") // transient runner log
 
-	p, err := BuildPlan(cfg, src)
+	p, err := BuildPlan(cfg, acct, src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +163,7 @@ func TestApplyCopiesSkipsJunkAndArchives(t *testing.T) {
 	}
 
 	// Re-import the same system -> the existing copy is archived under .archive.
-	p2, err := BuildPlan(cfg, src)
+	p2, err := BuildPlan(cfg, acct, src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +188,7 @@ func TestApplyCopiesSkipsJunkAndArchives(t *testing.T) {
 func TestDecommissionArchivesAndRemoves(t *testing.T) {
 	cfg := testCfg(t)
 	src := srcWith(t, `{"strategy":{"name":"s","symbol":"EURUSD","timeframe":15},"strategies":[]}`)
-	p, err := BuildPlan(cfg, src)
+	p, err := BuildPlan(cfg, acct, src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +214,7 @@ func TestDecommissionArchivesAndRemoves(t *testing.T) {
 func TestDecommissionRefusesRunning(t *testing.T) {
 	cfg := testCfg(t)
 	src := srcWith(t, `{"strategy":{"name":"s","symbol":"EURUSD","timeframe":15},"strategies":[]}`)
-	p, _ := BuildPlan(cfg, src)
+	p, _ := BuildPlan(cfg, acct, src)
 	if _, err := p.Apply(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +237,7 @@ func TestDecommissionRefusesRunning(t *testing.T) {
 
 func TestDecommissionMissing(t *testing.T) {
 	cfg := testCfg(t)
-	if _, err := Decommission(cfg, "nope/X/5"); err == nil || !strings.Contains(err.Error(), "not found") {
+	if _, err := Decommission(cfg, "fxify.demo/nope/X/5"); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("want not-found error, got %v", err)
 	}
 }
@@ -244,7 +249,7 @@ func TestDecommissionRejectsTraversal(t *testing.T) {
 	if err := os.MkdirAll(cfg.LiveBase, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{".", "..", "../escape", "a/../.."} {
+	for _, id := range []string{".", "..", "../escape", "a/../..", acct, acct + "/", acct + "/..", acct + "/../x", "strat/EURUSD/5"} {
 		if _, err := Decommission(cfg, id); err == nil {
 			t.Errorf("id %q should be rejected", id)
 		}
@@ -264,12 +269,23 @@ func TestBuildPlanRefusesRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := registry.Registry{Entries: map[string]registry.Entry{
-		"s/EURUSD/15": {SystemID: "s/EURUSD/15", PID: os.Getpid()},
+		"fxify.demo/s/EURUSD/15": {SystemID: "fxify.demo/s/EURUSD/15", PID: os.Getpid()},
 	}}
 	if err := registry.Save(cfg.RegistryPath(), reg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := BuildPlan(cfg, src); err == nil || !strings.Contains(err.Error(), "running") {
+	if _, err := BuildPlan(cfg, acct, src); err == nil || !strings.Contains(err.Error(), "running") {
 		t.Fatalf("want running refusal, got %v", err)
+	}
+}
+
+func TestBuildPlanRequiresAnAccountWithAnEnvFile(t *testing.T) {
+	cfg := testCfg(t)
+	src := srcWith(t, `{"strategy":{"name":"s","symbol":"EURUSD","timeframe":15},"strategies":[]}`)
+	if _, err := BuildPlan(cfg, "fxify", src); err == nil || !strings.Contains(err.Error(), "<broker>.<env>") {
+		t.Fatalf("want bad-account error, got %v", err)
+	}
+	if _, err := BuildPlan(cfg, "deriv.live", src); err == nil || !strings.Contains(err.Error(), "no broker env file") {
+		t.Fatalf("want missing-env error, got %v", err)
 	}
 }

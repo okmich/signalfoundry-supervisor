@@ -61,11 +61,8 @@ from the TUI on a Deriv-Demo terminal, and it is looking good.
 
 **Done:**
 
-- **Discovery / reconcile** — config-driven (single vs multi-trader via `config.json`), state from
-  `status.json` + PID liveness + inference freshness, `logical_systems[]` coverage gate.
-- **Lifecycle control** — `stop` / `start` / `restart`, single **and** bulk (`*-all`, with a confirm
-  gate on fleet-wide stops), via targeted console Ctrl+C; hard-kill fallback → `orphan_suspected`;
-  start-failure → `Crashed`.
+- **Discovery / reconcile** — by account folder (`LIVE_BASE\<account>\...`): single-trader (`<strategy>\<symbol>\<timeframe>`), multi-trader (`config.json` with `strategies[]`) or runner (a `run.py` directly under the account folder, e.g. `_account_admin`); state from `status.json` + PID liveness + inference freshness, read from the mirrored `LOG_BASE\<account>\...`, with the `logical_systems[]` coverage gate.
+- **Lifecycle control** — `stop` / `start` / `restart`, single **and** bulk, via targeted console Ctrl+C; hard-kill fallback → `orphan_suspected`. Every bulk action is confirmed and can be narrowed to the selected account (`[a]`); start-all starts every stopped system (`Stopped` and `Stopped(op)`) and skips the fault states (`Crashed`, `CrashLoopHalted`, `OrphanSuspected`). A runner that dies during startup fails the start at once → `Crashed`, with the reason shown in the TUI.
 - **Liveness + alerting** — `wedged` detection with an operator-tunable alert gate (`settings.json`,
   live-read); Telegram alerts from `notifier.env`.
 - **Re-attach + registry (§12)** — create-time PID-reuse guard with a persistent identity baseline;

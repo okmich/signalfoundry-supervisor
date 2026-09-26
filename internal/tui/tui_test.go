@@ -374,18 +374,24 @@ func TestConfirmGuardsSingleStart(t *testing.T) {
 	}
 }
 
-// Start-all is gated and, on confirm, fans out one start per eligible (Stopped) system.
+// Start-all is gated and, on confirm, fans out one start per stopped system (Stopped or Stopped(op)).
 func TestConfirmGuardsStartAll(t *testing.T) {
 	m := testModel(t)
 	armed, _ := m.handleKey(key("S"))
 	mm := armed.(model)
-	if mm.confirm == nil || mm.confirm.action != "start" || !mm.confirm.bulk || mm.confirm.count != 1 {
-		t.Fatalf("S should arm a bulk start confirm (1 Stopped target), got %+v", mm.confirm)
+	if mm.confirm == nil || mm.confirm.action != "start" || !mm.confirm.bulk || mm.confirm.count != 2 {
+		t.Fatalf("S should arm a bulk start confirm (2 stopped targets), got %+v", mm.confirm)
 	}
 	confirmed, _ := mm.handleKey(key("y"))
 	cmds, _ := ipc.PendingCommands(confirmed.(model).cfg.CommandsDir())
-	if len(cmds) != 1 || cmds[0].Action != "start" || cmds[0].SystemID != "b/Y/M5" {
-		t.Fatalf("confirmed start-all should submit one start for b/Y/M5, got %+v", cmds)
+	started := map[string]bool{}
+	for _, c := range cmds {
+		if c.Action == "start" {
+			started[c.SystemID] = true
+		}
+	}
+	if len(cmds) != 2 || !started["b/Y/M5"] || !started["d/W/M5"] {
+		t.Fatalf("confirmed start-all should submit starts for b/Y/M5 and d/W/M5, got %+v", cmds)
 	}
 }
 
@@ -632,8 +638,15 @@ func TestBulkTargets(t *testing.T) {
 		t.Errorf("restart targets = %v, want the 2 Running systems", got)
 	}
 	got := m.bulkTargets("start", "")
-	if len(got) != 1 || got[0] != "b/Y/M5" {
-		t.Errorf("start targets = %v, want only the Stopped system [b/Y/M5] (not StoppedByOperator)", got)
+	if len(got) != 2 || got[0] != "b/Y/M5" || got[1] != "d/W/M5" {
+		t.Errorf("start targets = %v, want the stopped systems [b/Y/M5 (Stopped) d/W/M5 (Stopped(op))]", got)
+	}
+	m.fleet.Systems = append(m.fleet.Systems,
+		ipc.System{SystemID: "e/C/M5", State: ipc.StateCrashed},
+		ipc.System{SystemID: "f/O/M5", State: ipc.StateOrphanSuspected},
+		ipc.System{SystemID: "g/H/M5", State: ipc.StateCrashLoopHalted})
+	if got := m.bulkTargets("start", ""); len(got) != 2 {
+		t.Errorf("start-all must skip the fault states, got %v", got)
 	}
 }
 

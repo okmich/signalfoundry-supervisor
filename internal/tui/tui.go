@@ -832,6 +832,9 @@ func (m *model) armBulkConfirm(action string) {
 }
 
 // bulkTargets returns the system_ids eligible for a bulk action (§11.1): the whole box, or one account.
+// start-all starts what is stopped — never run (Stopped) or stopped cleanly (Stopped(op), e.g. the whole box
+// after maintenance or a reboot) — and skips the fault states (Crashed, CrashLoopHalted, OrphanSuspected),
+// which want a look before a restart.
 func (m *model) bulkTargets(action, account string) []string {
 	var ids []string
 	for _, s := range m.fleet.Systems {
@@ -840,7 +843,7 @@ func (m *model) bulkTargets(action, account string) []string {
 		}
 		switch action {
 		case "start":
-			if s.State == ipc.StateStopped {
+			if s.State == ipc.StateStopped || s.State == ipc.StateStoppedByOp {
 				ids = append(ids, s.SystemID)
 			}
 		case "stop", "restart":

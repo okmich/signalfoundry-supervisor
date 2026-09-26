@@ -48,22 +48,24 @@ func Stop(pid int) error {
 	return nil
 }
 
-// MergeEnv returns base with each KEY=VALUE in overrides applied: a same-named base entry (compared
-// case-insensitively, as Windows does) is dropped and the override appended. Entries without '=' (and
-// Windows' hidden "=C:=..." drive entries, whose key is empty) are kept as-is.
-func MergeEnv(base, overrides []string) []string {
-	keys := map[string]bool{}
-	for _, kv := range overrides {
-		if k, _, ok := strings.Cut(kv, "="); ok && k != "" {
-			keys[strings.ToUpper(k)] = true
+// LastLine returns the last non-empty line of a (console capture) file, trimmed to max runes — for a runner
+// that died during startup, the line that says why (e.g. the exception of its traceback). "" if none.
+func LastLine(path string, max int) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	if len(b) > 64*1024 {
+		b = b[len(b)-64*1024:]
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if l := strings.TrimSpace(lines[i]); l != "" {
+			if r := []rune(l); len(r) > max {
+				return string(r[:max-1]) + "…"
+			}
+			return l
 		}
 	}
-	out := make([]string, 0, len(base)+len(overrides))
-	for _, kv := range base {
-		if k, _, ok := strings.Cut(kv, "="); ok && keys[strings.ToUpper(k)] {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return append(out, overrides...)
+	return ""
 }

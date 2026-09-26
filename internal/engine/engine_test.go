@@ -2,6 +2,7 @@ package engine
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -70,6 +71,7 @@ func testEngine(t *testing.T) *engine {
 		transitions: map[string]*transition{},
 		wedged:      map[string]bool{},
 		mismatched:  map[string]string{},
+		startErrors: map[string]string{},
 		identities:  map[string]identity{},
 		notifier:    notify.FromEnvFile(""), // no creds -> alert is a no-op
 		sessions:    session.NewChecker(dir),
@@ -329,17 +331,13 @@ func TestGroupAccounts(t *testing.T) {
 	}
 }
 
-// A start is refused when the account has no broker env file, and launch refuses a system outside an
-// account folder, so a runner is never spawned without OKMICH_QUANT_ACCOUNT.
+// A start is refused when the account has no broker env file.
 func TestStartGatedOnAccountEnv(t *testing.T) {
 	e := testEngine(t)
 	s := &ipc.System{SystemID: "deriv.live/x/Y/5", Account: "deriv.live", State: ipc.StateStopped}
 	res := e.doStart(ipc.Command{ID: "c1", SystemID: s.SystemID}, s, discovery.System{Account: "deriv.live", RunPy: "run.py"})
 	if res.Accepted || !strings.Contains(res.Error, "no broker env file") {
 		t.Errorf("missing env should refuse the start, got accepted=%v err=%q", res.Accepted, res.Error)
-	}
-	if _, err := e.launch("", "run.py"); err == nil {
-		t.Errorf("launch without an account must fail")
 	}
 }
 
@@ -385,5 +383,49 @@ func TestStartGatedOnSessionKeys(t *testing.T) {
 	res := e.doStart(ipc.Command{ID: "c1", SystemID: s.SystemID}, s, discovery.System{Account: "fxify.demo", RunPy: "run.py"})
 	if res.Accepted || !strings.Contains(res.Error, "lacks TERMINAL_PATH, LOGIN_SERVER") {
 		t.Errorf("want a missing-keys refusal, got accepted=%v err=%q", res.Accepted, res.Error)
+	}
+}
+
+// deadPID returns the PID of a process that has already exited.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("cmd", "/c", "exit", "0")
+	if err := cmd.Run(); err != nil {
+		t.Skip("cannot run a throwaway process: ", err)
+	}
+	return cmd.Process.Pid
+}
+
+// A runner that exits before reporting running fails the start at once — not at the deadline — with the last
+// line of its console output, and stays Crashed with that reason until the next start.
+func TestStartFailsFastWithTheReason(t *testing.T) {
+	e := testEngine(t)
+	console := filepath.Join(t.TempDir(), "z_console.log")
+	if err := os.WriteFile(console, []byte("Traceback...\nImportError: cannot import name 'load_account_env'\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id := "fxify.demo/idxmon-multi"
+	e.transitions[id] = &transition{action: "start", phase: "starting", pid: deadPID(t), console: console,
+		deadline: time.Now().UTC().Add(time.Hour)}
+	systems := []ipc.System{{SystemID: id, Account: "fxify.demo", State: ipc.StateStopped,
+		LogPaths: ipc.LogPaths{Status: filepath.Join(t.TempDir(), "status.json")}}}
+	e.applyTransitions(systems)
+	if systems[0].State != ipc.StateCrashed || !strings.Contains(systems[0].StartError, "exited during startup: ImportError: cannot import name 'load_account_env'") {
+		t.Fatalf("after a dead launch: state=%s err=%q", systems[0].State, systems[0].StartError)
+	}
+	if e.transitions[id] != nil {
+		t.Errorf("the failed start must be resolved, not left in flight")
+	}
+	// next tick: Reconcile knows nothing of it (no status.json) — the engine keeps it visible
+	next := []ipc.System{{SystemID: id, Account: "fxify.demo", State: ipc.StateStopped}}
+	e.applyStartErrors(next)
+	if next[0].State != ipc.StateCrashed || next[0].StartError == "" {
+		t.Fatalf("the failure must stay visible: %+v", next[0])
+	}
+	// running (started by hand) clears it
+	next[0].State = ipc.StateRunning
+	e.applyStartErrors(next)
+	if _, ok := e.startErrors[id]; ok {
+		t.Errorf("a running system clears its start error")
 	}
 }

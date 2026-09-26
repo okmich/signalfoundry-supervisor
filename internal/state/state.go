@@ -4,6 +4,7 @@ package state
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -142,15 +143,20 @@ func accountMismatch(folder string, env accounts.Info, rs contract.RunnerStatus)
 	return ""
 }
 
-// newestTextLog returns the most recent per-process text log (z_*_log_<ts>.log, written by the runner
-// via okmich_quant_core.setup_text_logger) in the runner-root log dir, or "" if none exists yet. The
-// timestamped names sort chronologically, so the lexically-greatest base name is the newest launch.
+// newestTextLog returns the most recently written z_*.log in the runner-root log dir, or "" if none exists
+// yet: the runner's own text log (z_system_log_<ts>.log, okmich_quant_core.setup_text_logger) or the console
+// capture the engine made of its launch (z_console_<ts>.log). By modification time, so a launch that died
+// before writing its own log shows its console capture, not an older run's log.
 func newestTextLog(runnerRootDir string) string {
 	matches, _ := filepath.Glob(filepath.Join(runnerRootDir, "z_*.log"))
-	newest := ""
+	newest, newestT := "", time.Time{}
 	for _, p := range matches {
-		if newest == "" || filepath.Base(p) > filepath.Base(newest) {
-			newest = p
+		info, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		if t := info.ModTime(); newest == "" || t.After(newestT) || (t.Equal(newestT) && filepath.Base(p) > filepath.Base(newest)) {
+			newest, newestT = p, t
 		}
 	}
 	return newest

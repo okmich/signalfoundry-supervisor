@@ -16,9 +16,6 @@ import (
 	"strings"
 )
 
-// EnvVar is the per-process variable the engine injects at spawn so a runner knows its account.
-const EnvVar = "OKMICH_QUANT_ACCOUNT"
-
 // AdminFolder is the Account Admin's folder inside an account, <live_base>/<account>/_account_admin: its code
 // and config, and the governance files it writes there (ACCOUNT_ADMIN_SPEC §3). It is an ordinary runner to
 // the supervisor, except that its governance must never be undone as a side effect: see AdminRuntime.

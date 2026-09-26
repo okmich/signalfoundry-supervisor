@@ -93,6 +93,9 @@ type System struct {
 	Broker     string      `json:"broker,omitempty"`     // status.json broker
 	AccountID  string      `json:"account_id,omitempty"` // status.json account_id: the terminal's login
 	SessionID  string      `json:"broker_session_id,omitempty"`
+	// StartError is why the last start of this system failed (the runner exited during startup or never reached
+	// running), with the last line of its console output; "" once a start succeeds or a new one is issued.
+	StartError string `json:"start_error,omitempty"`
 	// AccountMismatch explains why the running system does not match its account folder (status.json
 	// account, or the terminal login vs the env file's LOGIN_ID); "" when they agree or cannot be checked.
 	AccountMismatch string    `json:"account_mismatch,omitempty"`

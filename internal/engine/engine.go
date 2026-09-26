@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,13 +41,13 @@ const (
 // (it derives state purely from status.json), so the engine overlays these to show the in-flight
 // state until status.json catches up, and to drive the stop/start deadlines.
 type transition struct {
-	action   string    // "stop" | "start" | "restart"
-	phase    string    // restart only: "stopping" then "starting"
-	pid      int       // the control PID the action targets / the spawned PID
-	token    string    // status.json start token at fire time (PID-reuse context)
-	runPy    string    // start/restart: the run.py to (re)launch
-	account  string    // start/restart: the account folder, injected as OKMICH_QUANT_ACCOUNT on (re)launch
-	deadline time.Time // current phase deadline
+	action   string           // "stop" | "start" | "restart"
+	phase    string           // restart only: "stopping" then "starting"
+	pid      int              // the control PID the action targets / the spawned PID
+	token    string           // status.json start token at fire time (PID-reuse context)
+	sys      discovery.System // start/restart: the system to (re)launch
+	console  string           // start/restart: the console capture of the current launch
+	deadline time.Time        // current phase deadline
 }
 
 // identity is the (pid, create-time, start-token) the engine last confirmed for a Running system —
@@ -65,6 +66,7 @@ type engine struct {
 	notifier    *notify.Telegram       // ops alerts (orphan/wedged/crash/hard-kill); no-op without creds
 	wedged      map[string]bool        // system_id currently flagged wedged (edge-trigger the alert)
 	mismatched  map[string]string      // system_id -> its current account mismatch (edge-trigger the alert)
+	startErrors map[string]string      // system_id -> why its last start failed (published until the next start)
 	identities  map[string]identity    // system_id -> confirmed (pid, create-time) for PID-reuse guard
 	sessions    *session.Checker       // broker-session precondition gate (§13/§14)
 	lastPrune   time.Time              // throttles command-file housekeeping
@@ -99,6 +101,7 @@ func Run(cfg config.Config) error {
 		transitions: map[string]*transition{},
 		wedged:      map[string]bool{},
 		mismatched:  map[string]string{},
+		startErrors: map[string]string{},
 		identities:  map[string]identity{},
 		notifier:    notify.FromEnvFile(cfg.NotifierEnvPath()),
 		sessions:    session.NewChecker(cfg.StateDir),
@@ -136,6 +139,7 @@ func Run(cfg config.Config) error {
 			e.reconcileIdentities(systems)                                 // PID-reuse guard + registry re-attach baseline (§9/§12)
 			e.processCommands(systems)                                     // fire new actions, register transitions, write results
 			e.applyTransitions(systems)                                    // overlay in-flight state, drive deadlines, clear on completion
+			e.applyStartErrors(systems)                                    // a failed start stays visible (Crashed + why) until the next start
 			e.checkLiveness(systems, now, settings)                        // flag wedged (alive but stale JSONL), alert on the edge
 			e.checkAccounts(systems)                                       // alert when a running system disagrees with its account folder
 			accts := groupAccounts(systems, accounts.NewCache(cfg.EnvDir)) // blast-radius grouping (§7); orders systems by account
@@ -243,12 +247,13 @@ func (e *engine) doStart(c ipc.Command, s *ipc.System, d discovery.System) ipc.C
 		res.Accepted, res.Error = false, msg
 		return res
 	}
-	pid, err := e.launch(d.Account, d.RunPy)
+	pid, console, err := e.launch(d)
 	if err != nil {
 		res.Accepted, res.Error = false, fmt.Sprintf("spawn failed (python=%s): %v", e.cfg.Python, err)
 		return res
 	}
-	e.transitions[c.SystemID] = &transition{action: "start", phase: "starting", pid: pid, runPy: d.RunPy, account: d.Account, deadline: time.Now().UTC().Add(e.cfg.StartTimeout)}
+	delete(e.startErrors, c.SystemID)
+	e.transitions[c.SystemID] = &transition{action: "start", phase: "starting", pid: pid, sys: d, console: console, deadline: time.Now().UTC().Add(e.cfg.StartTimeout)}
 	log.Printf("engine: start spawned %s (pid=%d, python=%s)", c.SystemID, pid, e.cfg.Python)
 	res.Accepted, res.Outcome = true, "starting"
 	return res
@@ -280,17 +285,19 @@ func (e *engine) doRestart(c ipc.Command, s *ipc.System, d discovery.System) ipc
 			res.Accepted, res.Error = false, "stop (for restart) failed: "+err.Error()
 			return res
 		}
-		e.transitions[c.SystemID] = &transition{action: "restart", phase: "stopping", pid: s.PID, token: s.StartToken, runPy: d.RunPy, account: d.Account, deadline: time.Now().UTC().Add(e.cfg.StopTimeout)}
+		delete(e.startErrors, c.SystemID)
+		e.transitions[c.SystemID] = &transition{action: "restart", phase: "stopping", pid: s.PID, token: s.StartToken, sys: d, deadline: time.Now().UTC().Add(e.cfg.StopTimeout)}
 		log.Printf("engine: restart (stopping) %s (pid=%d)", c.SystemID, s.PID)
 		res.Accepted, res.Outcome = true, "restarting"
 		return res
 	}
-	pid, err := e.launch(d.Account, d.RunPy)
+	pid, console, err := e.launch(d)
 	if err != nil {
 		res.Accepted, res.Error = false, fmt.Sprintf("spawn failed (python=%s): %v", e.cfg.Python, err)
 		return res
 	}
-	e.transitions[c.SystemID] = &transition{action: "restart", phase: "starting", pid: pid, runPy: d.RunPy, account: d.Account, deadline: time.Now().UTC().Add(e.cfg.StartTimeout)}
+	delete(e.startErrors, c.SystemID)
+	e.transitions[c.SystemID] = &transition{action: "restart", phase: "starting", pid: pid, sys: d, console: console, deadline: time.Now().UTC().Add(e.cfg.StartTimeout)}
 	log.Printf("engine: restart (spawn, was %s) %s (pid=%d)", s.State, c.SystemID, pid)
 	res.Accepted, res.Outcome = true, "restarting"
 	return res
@@ -383,10 +390,12 @@ func (e *engine) resolveStart(id string, s *ipc.System, tr *transition, now time
 		delete(e.transitions, id)
 		return
 	}
-	if now.After(tr.deadline) {
-		s.State = ipc.StateCrashed
-		e.alert(fmt.Sprintf("%s: did not reach running within %s — start failed (crashed)", id, e.cfg.StartTimeout))
-		delete(e.transitions, id)
+	switch {
+	case !proc.Alive(tr.pid): // the runner exited before it reported running: fail now, not at the deadline
+		e.failStart(id, s, tr, "exited during startup")
+		return
+	case now.After(tr.deadline):
+		e.failStart(id, s, tr, fmt.Sprintf("did not reach running within %s", e.cfg.StartTimeout))
 		return
 	}
 	s.State = overlay
@@ -407,14 +416,14 @@ func (e *engine) resolveRestartStopping(id string, s *ipc.System, tr *transition
 		s.State = ipc.StateRestarting
 		return
 	}
-	pid, err := e.launch(tr.account, tr.runPy)
+	pid, console, err := e.launch(tr.sys)
 	if err != nil {
 		s.State = ipc.StateCrashed
 		log.Printf("engine: restart %s relaunch failed: %v", id, err)
 		delete(e.transitions, id)
 		return
 	}
-	tr.pid, tr.phase, tr.deadline = pid, "starting", now.Add(e.cfg.StartTimeout)
+	tr.pid, tr.phase, tr.console, tr.deadline = pid, "starting", console, now.Add(e.cfg.StartTimeout)
 	s.State = ipc.StateRestarting
 	log.Printf("engine: restart %s relaunched (pid=%d)", id, pid)
 }
@@ -668,14 +677,51 @@ func resolveInterpreter(python string) (string, error) {
 // reconcileIdentities once the system reaches Running via status.json — not at spawn time, since the
 // spawned PID may be a launcher/shim, not the interpreter that writes status.json.
 //
-// The child inherits the engine's environment plus OKMICH_QUANT_ACCOUNT=<account> (always overriding any
-// inherited value): the account folder is the single source of truth for which broker env the runner
-// loads and where it logs (ACCOUNT_LAYOUT_CHANGE_PLAN D3).
-func (e *engine) launch(account, runPy string) (int, error) {
-	if !accounts.Valid(account) {
-		return 0, fmt.Errorf("system is not in an account folder (account %q)", account)
+// The runner inherits the engine's environment unchanged; nothing about its account is passed — it loads its own
+// broker env, and the framework mirrors the account folder it is deployed in. Its console output (stdout and
+// stderr) goes to <log_base>\<account>\<runner root>\z_console_<UTC>.log, beside the log it writes itself, so a
+// runner that dies before it can log still leaves the reason behind. Returns the PID and the capture's path.
+func (e *engine) launch(d discovery.System) (int, string, error) {
+	dir := filepath.Join(e.cfg.LogBase, d.Account, d.RunnerStrategy)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, "", err
 	}
-	return proc.Spawn(e.cfg.Python, runPy, []string{accounts.EnvVar + "=" + account})
+	console := filepath.Join(dir, "z_console_"+time.Now().UTC().Format("20060102T150405Z")+".log")
+	pid, err := proc.Spawn(e.cfg.Python, d.RunPy, console)
+	return pid, console, err
+}
+
+// failStart marks a start that did not reach running: Crashed now, with the last line of the runner's console
+// output as the reason, alerted once and kept visible (applyStartErrors) until the next start of the system.
+func (e *engine) failStart(id string, s *ipc.System, tr *transition, why string) {
+	msg := why
+	if last := proc.LastLine(tr.console, 240); last != "" {
+		msg += ": " + last
+	}
+	if tr.console != "" {
+		msg += " (output: " + tr.console + ")"
+	}
+	e.startErrors[id] = msg
+	s.State, s.StartError = ipc.StateCrashed, msg
+	e.alert(fmt.Sprintf("%s: start failed — %s", id, msg))
+	delete(e.transitions, id)
+}
+
+// applyStartErrors keeps a failed start visible: status.json never recorded the dead runner, so without this
+// the row would fall back to Stopped on the next tick and the reason would be lost. A running system (someone
+// started it by hand) or a new start clears it.
+func (e *engine) applyStartErrors(systems []ipc.System) {
+	for i := range systems {
+		s := &systems[i]
+		msg, ok := e.startErrors[s.SystemID]
+		switch {
+		case !ok:
+		case s.State == ipc.StateRunning:
+			delete(e.startErrors, s.SystemID)
+		case s.State == ipc.StateStopped || s.State == ipc.StateCrashed:
+			s.State, s.StartError = ipc.StateCrashed, msg
+		}
+	}
 }
 
 // accountGate refuses a start/restart whose account has no broker env file, or one without the session

@@ -495,6 +495,7 @@ func TestImportInstallsValidatedSystem(t *testing.T) {
 	press := func(k tea.KeyMsg) { tm, _ := m.handleKey(k); m = tm.(model) }
 
 	press(key("i"))
+	press(tea.KeyMsg{Type: tea.KeyTab})   // choose the account: there is no default
 	press(key(src))                       // type the source path
 	press(tea.KeyMsg{Type: tea.KeyEnter}) // validate
 	if m.importing == nil || m.importing.plan == nil {
@@ -782,12 +783,16 @@ func TestImportChoosesAccount(t *testing.T) {
 	press := func(k tea.KeyMsg) { tm, _ := m.handleKey(k); m = tm.(model) }
 
 	press(key("i"))
+	if out := m.View(); !strings.Contains(out, "none chosen") {
+		t.Fatalf("the dialog must start with no account chosen:\n%s", out)
+	}
+	press(tea.KeyMsg{Type: tea.KeyTab}) // fxify.demo
 	if out := m.View(); !strings.Contains(out, "fxify.demo") || !strings.Contains(out, "1/2") {
-		t.Fatalf("the dialog should show the first account:\n%s", out)
+		t.Fatalf("tab should choose the first account:\n%s", out)
 	}
 	press(tea.KeyMsg{Type: tea.KeyTab})
 	press(tea.KeyMsg{Type: tea.KeyTab})
-	press(tea.KeyMsg{Type: tea.KeyShiftTab}) // wraps forward twice then back once -> icmarkets.demo
+	press(tea.KeyMsg{Type: tea.KeyShiftTab}) // fxify -> icmarkets -> fxify, back once -> icmarkets.demo
 	press(key(src))
 	press(tea.KeyMsg{Type: tea.KeyEnter})
 	if m.importing == nil || m.importing.plan == nil || m.importing.plan.SystemID != "icmarkets.demo/rsi2/EURUSD/5" {
@@ -848,5 +853,41 @@ func TestBulkConfirmOffersTheSelectedAccount(t *testing.T) {
 	}
 	if !strings.Contains(dm.status, "stop icmarkets.demo") {
 		t.Errorf("status = %q", dm.status)
+	}
+}
+
+// Enter is refused until an account is chosen: there is no default account to import into by accident.
+func TestImportRequiresAChosenAccount(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Config{LiveBase: filepath.Join(dir, "live"), StateDir: filepath.Join(dir, "state"), EnvDir: envDirWith(t, "deriv.demo", "icmarkets.demo")}
+	src := filepath.Join(dir, "incoming", "rsi2")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(src, "run.py"), []byte("# run"), 0o644)
+	_ = os.WriteFile(filepath.Join(src, "config.json"), []byte(`{"strategy":{"name":"rsi2","symbol":"EURUSD","timeframe":5}}`), 0o644)
+	m := model{cfg: cfg, pending: map[string]pendingCmd{}, width: 92}
+	press := func(k tea.KeyMsg) { tm, _ := m.handleKey(k); m = tm.(model) }
+	press(key("i"))
+	press(key(src))
+	press(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.importing == nil || m.importing.plan != nil || !strings.Contains(m.importing.errText, "choose the account") {
+		t.Fatalf("want a choose-the-account refusal, got %+v", m.importing)
+	}
+}
+
+// A failed start is shown on its row and explained in the details.
+func TestStartErrorIsShown(t *testing.T) {
+	m := testModel(t)
+	m.width, m.height = 150, 30
+	m.fleet.Systems = []ipc.System{{SystemID: "fxify.demo/idxmon-multi", Account: "fxify.demo", State: ipc.StateCrashed,
+		StartError: "exited during startup: ImportError: cannot import name 'x' (output: E:\\quant\\logs\\z_console.log)"}}
+	m.cursor = 0
+	if out := m.fleetView(); !strings.Contains(out, "start failed") {
+		t.Fatalf("the row should flag the failed start:\n%s", out)
+	}
+	m.openDetail()
+	if out := m.detailView(); !strings.Contains(out, "ImportError: cannot import name 'x'") {
+		t.Fatalf("the details should say why:\n%s", out)
 	}
 }

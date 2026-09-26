@@ -154,7 +154,7 @@ type awaitStart struct {
 // archive+install. Closing the TUI mid-flow is safe — the install is a staged atomic rename.
 type importState struct {
 	accounts []string        // the box's accounts (a .env.<account> in ENV_DIR), the import targets
-	acct     int             // index of the chosen account in accounts
+	acct     int             // index of the chosen account in accounts; -1 until the operator picks one (no default)
 	input    string          // source path being typed (editing phase)
 	plan     *importsys.Plan // non-nil once validated -> confirm phase
 	errText  string          // last validation error, shown inline
@@ -265,7 +265,7 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "D": // decommission — archive the artefact & drop it from the fleet (confirmed; shift-D for friction)
 		m.armDecommissionConfirm(m.currentSystemID())
 	case "i": // open the import-system dialog
-		m.importing = &importState{accounts: accounts.List(m.cfg.EnvDir)}
+		m.importing = &importState{accounts: accounts.List(m.cfg.EnvDir), acct: -1}
 		m.status = ""
 	case "c": // open the settings screen
 		m.openSettings()
@@ -342,15 +342,24 @@ func (m model) handleImportKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.importing, m.status = nil, "import cancelled"
 	case "tab", "shift+tab": // choose the target account
 		if n := len(im.accounts); n > 0 {
-			step := 1
-			if k.String() == "shift+tab" {
-				step = n - 1
+			switch {
+			case im.acct < 0 && k.String() == "shift+tab":
+				im.acct = n - 1
+			case im.acct < 0:
+				im.acct = 0
+			case k.String() == "shift+tab":
+				im.acct = (im.acct + n - 1) % n
+			default:
+				im.acct = (im.acct + 1) % n
 			}
-			im.acct = (im.acct + step) % n
 		}
 	case "enter":
 		if len(im.accounts) == 0 {
 			im.plan, im.errText = nil, "no accounts: add a .env.<broker>.<env> file to "+m.cfg.EnvDir
+			break
+		}
+		if im.acct < 0 {
+			im.plan, im.errText = nil, "choose the account this system trades first (tab)"
 			break
 		}
 		if plan, err := importsys.BuildPlan(m.cfg, im.accounts[im.acct], im.input); err != nil {
@@ -576,6 +585,9 @@ func (m model) systemRow(s ipc.System, selected bool) string {
 	}
 	if s.AccountMismatch != "" {
 		row += alertStyle.Render(" ⚠ ACCOUNT")
+	}
+	if s.StartError != "" {
+		row += alertStyle.Render(" ✗ start failed — l for why")
 	}
 	return row
 }
@@ -964,7 +976,10 @@ func (m model) importView() string {
 			disp = "…" + string(r[len(r)-maxw+1:]) // tail-clip so the typed end stays visible
 		}
 		acct := alertStyle.Render("(no accounts — add a .env.<broker>.<env> to ENV_DIR)")
-		if len(im.accounts) > 0 {
+		switch {
+		case len(im.accounts) > 0 && im.acct < 0:
+			acct = alertStyle.Render("‹ none chosen ›") + dimStyle.Render(fmt.Sprintf("  (tab to choose among %d: %s)", len(im.accounts), strings.Join(im.accounts, ", ")))
+		case len(im.accounts) > 0:
 			acct = selStyle.Render(im.accounts[im.acct]) + dimStyle.Render(fmt.Sprintf("  (%d/%d · tab to change)", im.acct+1, len(im.accounts)))
 		}
 		body = append(body,
@@ -1291,6 +1306,9 @@ func (m model) detailStatusBody(s ipc.System) []string {
 	}
 	if s.AccountMismatch != "" {
 		rows = append(rows, "  "+alertStyle.Render("⚠ account mismatch: ")+s.AccountMismatch)
+	}
+	if s.StartError != "" {
+		rows = append(rows, "  "+alertStyle.Render("✗ start failed: ")+s.StartError)
 	}
 	return rows
 }

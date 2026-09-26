@@ -105,10 +105,8 @@ from the TUI on a Deriv-Demo terminal, and it is looking good.
   a system the engine discovers). The Account Admin (`_account_admin`) is protected: an import keeps its
   directive, state and requests, and decommission is refused. Both the import dialog (its
   own view + key handler) and the `D` confirm are wired into the TUI and covered by regression tests.
-- **Account passthrough** — the engine spawns each `run.py` with its own environment plus
-  `OKMICH_QUANT_ACCOUNT=<account>` from the system's account folder; the system loads
-  `OKMICH_QUANT_ENV_DIR\.env.<account>` and logs under `LOG_BASE\<account>`. A manual launch sets the
-  variable by hand. `OKMICH_QUANT_ACCOUNT` is never set machine-wide.
+- **Accounts without coupling** — the account is chosen at import (no default) and only decides where a system lives; nothing is passed to the runner, which loads its own broker env. The framework mirrors the account folder in the log paths. The engine checks each running system's terminal login against the folder's `.env` `LOGIN_ID`.
+- **Failed starts explain themselves** — each launch's console output goes to `LOG_BASE\<account>\<runner root>\z_console_<UTC>.log`; a runner that exits before reporting running is marked `Crashed` at once, with the last line of that output shown on its row and in its details, until its next start.
 - **Migration** — `supervisor migrate-layout` moves a flat box into the account layout once (dry run by
   default; `--apply` refuses while anything runs and proves every move before the first).
 

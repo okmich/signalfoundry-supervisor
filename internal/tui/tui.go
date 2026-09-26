@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/okmich/signalfoundry-supervisor/internal/accounts"
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
 	"github.com/okmich/signalfoundry-supervisor/internal/importsys"
 	"github.com/okmich/signalfoundry-supervisor/internal/ipc"
@@ -127,6 +128,8 @@ type confirmState struct {
 	bulk     bool   // whole-box fan-out vs a single system
 	systemID string // single target (empty for bulk / quit)
 	count    int    // bulk target count (for the prompt)
+	account  string // bulk only: the selected system's account, offered as the narrower scope ([a])
+	acctN    int    // bulk only: eligible targets in that account (0 -> the [a] scope is not offered)
 }
 
 type pendingCmd struct {
@@ -150,9 +153,11 @@ type awaitStart struct {
 // into a Plan (import mode is purely a TUI client of importsys), then a y/n confirm gates the
 // archive+install. Closing the TUI mid-flow is safe — the install is a staged atomic rename.
 type importState struct {
-	input   string          // source path being typed (editing phase)
-	plan    *importsys.Plan // non-nil once validated -> confirm phase
-	errText string          // last validation error, shown inline
+	accounts []string        // the box's accounts (a .env.<account> in ENV_DIR), the import targets
+	acct     int             // index of the chosen account in accounts; -1 until the operator picks one (no default)
+	input    string          // source path being typed (editing phase)
+	plan     *importsys.Plan // non-nil once validated -> confirm phase
+	errText  string          // last validation error, shown inline
 }
 
 type tickMsg time.Time
@@ -260,7 +265,7 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "D": // decommission — archive the artefact & drop it from the fleet (confirmed; shift-D for friction)
 		m.armDecommissionConfirm(m.currentSystemID())
 	case "i": // open the import-system dialog
-		m.importing = &importState{}
+		m.importing = &importState{accounts: accounts.List(m.cfg.EnvDir), acct: -1}
 		m.status = ""
 	case "c": // open the settings screen
 		m.openSettings()
@@ -277,7 +282,12 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) handleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	c := m.confirm
 	m.confirm = nil
-	if s := k.String(); s != "y" && s != "Y" {
+	s := k.String()
+	if c.bulk && c.acctN > 0 && (s == "a" || s == "A") { // the narrower scope: only the selected account
+		m.submitBulk(c.action, c.account)
+		return m, nil
+	}
+	if s != "y" && s != "Y" {
 		m.status = "cancelled"
 		return m, nil
 	}
@@ -292,7 +302,7 @@ func (m model) handleConfirmKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "start", "stop", "restart", "kill":
 		if c.bulk {
-			m.submitBulk(c.action)
+			m.submitBulk(c.action, "")
 		} else {
 			m.submitByID(c.action, c.systemID)
 		}
@@ -330,8 +340,29 @@ func (m model) handleImportKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.String() { // editing phase
 	case "esc":
 		m.importing, m.status = nil, "import cancelled"
+	case "tab", "shift+tab": // choose the target account
+		if n := len(im.accounts); n > 0 {
+			switch {
+			case im.acct < 0 && k.String() == "shift+tab":
+				im.acct = n - 1
+			case im.acct < 0:
+				im.acct = 0
+			case k.String() == "shift+tab":
+				im.acct = (im.acct + n - 1) % n
+			default:
+				im.acct = (im.acct + 1) % n
+			}
+		}
 	case "enter":
-		if plan, err := importsys.BuildPlan(m.cfg, im.input); err != nil {
+		if len(im.accounts) == 0 {
+			im.plan, im.errText = nil, "no accounts: add a .env.<broker>.<env> file to "+m.cfg.EnvDir
+			break
+		}
+		if im.acct < 0 {
+			im.plan, im.errText = nil, "choose the account this system trades first (tab)"
+			break
+		}
+		if plan, err := importsys.BuildPlan(m.cfg, im.accounts[im.acct], im.input); err != nil {
 			im.plan, im.errText = nil, err.Error()
 		} else {
 			im.plan, im.errText = &plan, ""
@@ -461,23 +492,29 @@ func (m model) fleetView() string {
 	if len(m.fleet.Systems) == 0 {
 		body = append(body, dimStyle.Render("  (no systems)"))
 	}
-	terms := make(map[string]ipc.Terminal, len(m.fleet.Terminals))
-	for _, t := range m.fleet.Terminals {
-		terms[t.BrokerSessionID] = t
+	accts := make(map[string]ipc.Account, len(m.fleet.Accounts))
+	for _, a := range m.fleet.Accounts {
+		accts[a.Name] = a
 	}
-	prevSession := "\x00" // sentinel before any real session
+	prevAccount := "\x00" // sentinel before any real account
 	for i, s := range m.fleet.Systems {
-		if s.SessionID != prevSession { // start of a terminal group -> subheader
-			prevSession = s.SessionID
-			body = append(body, m.terminalHeader(s.SessionID, terms))
+		if s.Account != prevAccount { // start of an account group -> subheader
+			prevAccount = s.Account
+			body = append(body, accountHeader(accts[s.Account], s.Account))
 		}
 		body = append(body, m.systemRow(s, i == m.cursor))
 	}
 
-	right := dimStyle.Render(plural(len(m.fleet.Systems), "system") + " · " + plural(len(m.fleet.Terminals), "terminal"))
+	right := dimStyle.Render(plural(len(m.fleet.Systems), "system") + " · " + plural(len(m.fleet.Accounts), "account"))
 	box := titledBox(boxTitleStyle.Render("fleet"), right, m.cols()-2, len(body), body)
 
 	lines := []string{m.titleBar("fleet"), "", box, ""}
+	for _, p := range m.fleet.Problems { // things under LIVE_BASE the engine will not run
+		lines = append(lines, alertStyle.Render("⚠ "+p.Path)+dimStyle.Render(" — "+p.Reason))
+	}
+	if len(m.fleet.Problems) > 0 {
+		lines = append(lines, "")
+	}
 	if c := m.confirmBar(); c != "" {
 		lines = append(lines, c)
 	}
@@ -508,6 +545,10 @@ func (m model) confirmBar() string {
 		what = fmt.Sprintf("KILL %s (force — skips graceful shutdown)", c.systemID)
 	case c.bulk:
 		what = fmt.Sprintf("%s ALL %d system(s)", strings.ToUpper(c.action), c.count)
+		if c.acctN > 0 {
+			return alertStyle.Render(what+"?") + dimStyle.Render(fmt.Sprintf("   [y] all %d   ·   [a] %s only (%d)   ·   any other key cancels",
+				c.count, c.account, c.acctN))
+		}
 	default:
 		what = fmt.Sprintf("%s %s", strings.ToUpper(c.action), c.systemID)
 	}
@@ -530,7 +571,7 @@ func (m model) systemRow(s ipc.System, selected bool) string {
 	if s.State == ipc.StateRunning && s.LastBarAgeS > 0 { // for a multi runner this is the STALEST leg (§15)
 		age = fmt.Sprintf("%.0fs", s.LastBarAgeS)
 	}
-	id := s.SystemID
+	id := strings.TrimPrefix(s.SystemID, s.Account+"/") // the account is in the group header
 	if s.Multi {
 		id += fmt.Sprintf(" ·%dsym", len(s.Symbols))
 	}
@@ -542,32 +583,44 @@ func (m model) systemRow(s ipc.System, selected bool) string {
 	if s.Wedged {
 		row += wedgeStyle.Render("⚠ WEDGED")
 	}
+	if s.AccountMismatch != "" {
+		row += alertStyle.Render(" ⚠ ACCOUNT")
+	}
+	if s.StartError != "" {
+		row += alertStyle.Render(" ✗ start failed — l for why")
+	}
 	return row
 }
 
-// terminalHeader is the blast-radius subheader for a broker session (§7): account + the N/10 cap
-// (logical systems = PIDs = terminal IPC slots), reddened when over cap, plus the leg count when a
-// multi-trader makes legs ≠ systems. Non-running systems group under an "— not running —" header.
-func (m model) terminalHeader(session string, terms map[string]ipc.Terminal) string {
-	if session == "" {
-		return dimStyle.Render("— not running —")
+// accountHeader is the blast-radius subheader for an account folder (§7): one env file = one terminal +
+// one login. It shows the account, its login and server, the N/10 cap (live logical systems = PIDs =
+// terminal IPC slots, reddened when over cap — reported, never enforced), the leg count when a
+// multi-trader makes legs ≠ systems, the session health, and a warning when the env file is missing.
+func accountHeader(a ipc.Account, name string) string {
+	id := name
+	if a.Login != "" {
+		id += " · " + a.Login
 	}
-	t := terms[session]
-	acct := t.Account
-	if acct == "" {
-		acct = "?"
+	if a.Server != "" {
+		id += " @ " + a.Server
 	}
-	capStr, capStyle := fmt.Sprintf("%d/%d systems", t.LogicalSystems, terminalCap), dimStyle
-	if t.LogicalSystems > terminalCap {
+	capStr, capStyle := fmt.Sprintf("%d/%d systems", a.LogicalSystems, terminalCap), dimStyle
+	if a.LogicalSystems > terminalCap {
 		capStr += "  OVER CAP"
 		capStyle = alertStyle
 	}
-	hdr := headerStyle.Render(fmt.Sprintf("terminal %s · %s · ", session, acct)) + capStyle.Render(capStr)
-	if t.Legs > t.LogicalSystems { // a multi-trader carries several symbols on its one slot: concentration, not cap
-		hdr += dimStyle.Render(fmt.Sprintf(" · %d legs", t.Legs))
+	hdr := headerStyle.Render(id+" · ") + capStyle.Render(capStr)
+	if a.Legs > a.LogicalSystems { // a multi-trader carries several symbols on its one slot: concentration, not cap
+		hdr += dimStyle.Render(fmt.Sprintf(" · %d legs", a.Legs))
 	}
-	if b := healthBadge(t.Health); b != "" { // broker-session precondition (§13)
+	if b := healthBadge(a.Health); b != "" { // broker-session precondition (§13)
 		hdr += dimStyle.Render(" · ") + b
+	}
+	switch {
+	case a.EnvMissing:
+		hdr += dimStyle.Render(" · ") + alertStyle.Render("no .env."+name+" — cannot start")
+	case len(a.EnvMissingKeys) > 0:
+		hdr += dimStyle.Render(" · ") + alertStyle.Render(".env lacks "+strings.Join(a.EnvMissingKeys, ", ")+" — cannot start")
 	}
 	return hdr
 }
@@ -678,6 +731,10 @@ func (m *model) armDecommissionConfirm(systemID string) {
 		m.status = "stop " + systemID + " before decommissioning"
 		return
 	}
+	if strings.HasSuffix(systemID, "/"+accounts.AdminFolder) {
+		m.status = systemID + " is the Account Admin: governance is removed by runbook (ACCOUNT_ADMIN_SPEC §8.3), not by decommission"
+		return
+	}
 	m.confirm = &confirmState{action: "decommission", systemID: systemID}
 }
 
@@ -736,11 +793,16 @@ func (m *model) reconcileAwaiting() {
 }
 
 // submitBulk fans out one single-system command per eligible target (§11.1: bulk is a fan-out, not
-// a new command shape). Eligibility: start-all -> Stopped; stop-all / restart-all -> Running.
-func (m *model) submitBulk(action string) {
-	targets := m.bulkTargets(action)
+// a new command shape). Eligibility: start-all -> Stopped; stop-all / restart-all -> Running. A non-empty
+// account narrows the fan-out to that account's systems.
+func (m *model) submitBulk(action, account string) {
+	targets := m.bulkTargets(action, account)
+	scope := action + "-all"
+	if account != "" {
+		scope = action + " " + account
+	}
 	if len(targets) == 0 {
-		m.status = "nothing eligible for " + action + "-all"
+		m.status = "nothing eligible for " + scope
 		return
 	}
 	n := 0
@@ -750,24 +812,38 @@ func (m *model) submitBulk(action string) {
 			n++
 		}
 	}
-	m.status = fmt.Sprintf("submitted %s-all to %d system(s)", action, n)
+	m.status = fmt.Sprintf("submitted %s to %d system(s)", scope, n)
 }
 
+// armBulkConfirm arms the confirm for a whole-box action and offers the selected system's account as the
+// narrower scope (one broker down: stop that account, keep the others).
 func (m *model) armBulkConfirm(action string) {
-	if n := len(m.bulkTargets(action)); n > 0 {
-		m.confirm = &confirmState{action: action, bulk: true, count: n}
-	} else {
+	n := len(m.bulkTargets(action, ""))
+	if n == 0 {
 		m.status = "nothing eligible for " + action + "-all"
+		return
 	}
+	c := &confirmState{action: action, bulk: true, count: n}
+	if m.cursor >= 0 && m.cursor < len(m.fleet.Systems) {
+		c.account = m.fleet.Systems[m.cursor].Account
+		c.acctN = len(m.bulkTargets(action, c.account))
+	}
+	m.confirm = c
 }
 
-// bulkTargets returns the system_ids eligible for a whole-box action (§11.1).
-func (m *model) bulkTargets(action string) []string {
+// bulkTargets returns the system_ids eligible for a bulk action (§11.1): the whole box, or one account.
+// start-all starts what is stopped — never run (Stopped) or stopped cleanly (Stopped(op), e.g. the whole box
+// after maintenance or a reboot) — and skips the fault states (Crashed, CrashLoopHalted, OrphanSuspected),
+// which want a look before a restart.
+func (m *model) bulkTargets(action, account string) []string {
 	var ids []string
 	for _, s := range m.fleet.Systems {
+		if account != "" && s.Account != account {
+			continue
+		}
 		switch action {
 		case "start":
-			if s.State == ipc.StateStopped {
+			if s.State == ipc.StateStopped || s.State == ipc.StateStoppedByOp {
 				ids = append(ids, s.SystemID)
 			}
 		case "stop", "restart":
@@ -902,8 +978,17 @@ func (m model) importView() string {
 			r := []rune(disp)
 			disp = "…" + string(r[len(r)-maxw+1:]) // tail-clip so the typed end stays visible
 		}
+		acct := alertStyle.Render("(no accounts — add a .env.<broker>.<env> to ENV_DIR)")
+		switch {
+		case len(im.accounts) > 0 && im.acct < 0:
+			acct = alertStyle.Render("‹ none chosen ›") + dimStyle.Render(fmt.Sprintf("  (tab to choose among %d: %s)", len(im.accounts), strings.Join(im.accounts, ", ")))
+		case len(im.accounts) > 0:
+			acct = selStyle.Render(im.accounts[im.acct]) + dimStyle.Render(fmt.Sprintf("  (%d/%d · tab to change)", im.acct+1, len(im.accounts)))
+		}
 		body = append(body,
-			dimStyle.Render("Source artefact directory to import into LIVE_BASE:"),
+			dimStyle.Render("Account: ")+acct,
+			"",
+			dimStyle.Render("Source artefact directory to import into LIVE_BASE/<account>:"),
 			"",
 			"  "+selStyle.Render(disp)+cursorStyle.Render("█"),
 			"",
@@ -916,8 +1001,11 @@ func (m model) importView() string {
 	} else { // confirm phase
 		p := im.plan
 		kind := "single-trader"
-		if p.Multi {
+		switch {
+		case p.Multi:
 			kind = fmt.Sprintf("multi-trader · %d symbols", len(p.Symbols))
+		case p.Runner:
+			kind = "runner"
 		}
 		field := func(label, val string) string {
 			return "  " + dimStyle.Width(11).Render(label) + selStyle.Render(truncate(val, innerW-14))
@@ -925,6 +1013,7 @@ func (m model) importView() string {
 		body = append(body,
 			okStyle.Render("Validated — review, then install:"),
 			"",
+			field("account", p.Account),
 			field("type", kind),
 			field("system id", p.SystemID),
 			field("source", p.SourceDir),
@@ -936,6 +1025,9 @@ func (m model) importView() string {
 		if p.WillArchive {
 			body = append(body, "", alertStyle.Render("⚠ a copy already exists at the target — it is archived first"))
 		}
+		if p.Runner && p.Strategy == accounts.AdminFolder {
+			body = append(body, dimStyle.Render("Account Admin: the installed directive, state and requests are kept; none are taken from the source"))
+		}
 	}
 	box := titledBox(boxTitleStyle.Render("import system"), dimStyle.Render("provision into LIVE_BASE · §16"), innerW, len(body), body)
 
@@ -944,7 +1036,7 @@ func (m model) importView() string {
 		lines = append(lines, m.statusStyle().Render(m.status))
 	}
 	if im.plan == nil {
-		lines = append(lines, "", hintBar(hint{"type", "source path"}, hint{"enter", "validate"}, hint{"ctrl+u", "clear"}, hint{"esc", "cancel"}))
+		lines = append(lines, "", hintBar(hint{"tab", "account"}, hint{"type", "source path"}, hint{"enter", "validate"}, hint{"ctrl+u", "clear"}, hint{"esc", "cancel"}))
 	} else {
 		lines = append(lines, "", hintBar(hint{"y", "install"}, hint{"any", "edit path"}, hint{"esc", "cancel"}))
 	}
@@ -995,9 +1087,9 @@ func (m model) sessionHealth(sessionID string) string {
 	if sessionID == "" {
 		return ""
 	}
-	for _, t := range m.fleet.Terminals {
-		if t.BrokerSessionID == sessionID {
-			return t.Health
+	for _, a := range m.fleet.Accounts {
+		if a.BrokerSessionID == sessionID {
+			return a.Health
 		}
 	}
 	return ""
@@ -1211,10 +1303,17 @@ func (m model) detailStatusBody(s ipc.System) []string {
 		}
 		wedged = wedgeStyle.Render(w)
 	}
-	return []string{
-		"  " + f("PID", val(pid)) + f("Broker", val(s.Broker)) + f("Account", val(s.Account)) + f("Session", val(s.SessionID)),
+	rows := []string{
+		"  " + f("PID", val(pid)) + f("Account", val(s.Account)) + f("Login", val(s.AccountID)) + f("Session", val(s.SessionID)),
 		"  " + f("Token", val(shortToken(s.StartToken))) + f("Started", val(started)) + f("Bar age", val(age)) + f("Wedged", wedged),
 	}
+	if s.AccountMismatch != "" {
+		rows = append(rows, "  "+alertStyle.Render("⚠ account mismatch: ")+s.AccountMismatch)
+	}
+	if s.StartError != "" {
+		rows = append(rows, "  "+alertStyle.Render("✗ start failed: ")+s.StartError)
+	}
+	return rows
 }
 
 // tabStrip renders the inference symbol tabs into the right pane's border — active tab reverse-video,

@@ -4,12 +4,40 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
 	"github.com/okmich/signalfoundry-supervisor/internal/ipc"
 )
+
+const acct = "fxify.demo"
+
+// box lays out a scratch LIVE_BASE / LOG_BASE / ENV_DIR with one account, fxify.demo, whose env file
+// carries LOGIN_ID 42.
+func box(t *testing.T) (cfg config.Config, live, logb string) {
+	t.Helper()
+	root := t.TempDir()
+	cfg = config.Config{LiveBase: filepath.Join(root, "live"), LogBase: filepath.Join(root, "log"), EnvDir: filepath.Join(root, "env")}
+	if err := os.MkdirAll(cfg.EnvDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.EnvDir, ".env."+acct), []byte("LOGIN_ID=42\nLOGIN_SERVER=Demo\nTERMINAL_PATH=C:\\mt5\\terminal64.exe\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, filepath.Join(cfg.LiveBase, acct), filepath.Join(cfg.LogBase, acct)
+}
+
+func writeStatus(t *testing.T, dir, body string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "status.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestNewestTextLog(t *testing.T) {
 	dir := t.TempDir()
@@ -32,9 +60,7 @@ func TestNewestTextLog(t *testing.T) {
 // same strategy that the runner does NOT cover must stay Stopped — it must not inherit the runner's
 // live PID/state (which would make it a wrong stop/kill target).
 func TestReconcileGatesOnLogicalSystems(t *testing.T) {
-	root := t.TempDir()
-	live := filepath.Join(root, "live")
-	logb := filepath.Join(root, "log")
+	cfg, live, logb := box(t)
 	const strat = "rsi2_mean_reversion"
 
 	for _, sym := range []string{"EURUSD", "GBPUSD"} {
@@ -51,20 +77,27 @@ func TestReconcileGatesOnLogicalSystems(t *testing.T) {
 		t.Fatal(err)
 	}
 	// One runner, running as THIS (alive) process, claiming only EURUSD.
-	status := fmt.Sprintf(`{"state":"running","pid":%d,"logical_systems":[{"symbol":"EURUSD","timeframe":5}]}`, os.Getpid())
+	status := fmt.Sprintf(`{"state":"running","pid":%d,"account":"fxify.demo","account_id":"42","logical_systems":[{"symbol":"EURUSD","timeframe":5}]}`, os.Getpid())
 	if err := os.WriteFile(filepath.Join(statusDir, "status.json"), []byte(status), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	got := map[string]ipc.State{}
-	for _, s := range Reconcile(config.Config{LiveBase: live, LogBase: logb}) {
+	systems, problems := Reconcile(cfg)
+	for _, s := range systems {
 		got[s.SystemID] = s.State
+		if s.AccountMismatch != "" {
+			t.Errorf("%s: unexpected account mismatch %q", s.SystemID, s.AccountMismatch)
+		}
 	}
-	if got[strat+"/EURUSD/M5"] != ipc.StateRunning {
-		t.Errorf("EURUSD (covered + alive pid) should be Running, got %s", got[strat+"/EURUSD/M5"])
+	if len(problems) != 0 {
+		t.Errorf("unexpected problems %+v", problems)
 	}
-	if got[strat+"/GBPUSD/M5"] != ipc.StateStopped {
-		t.Errorf("GBPUSD (not in logical_systems) should stay Stopped, got %s", got[strat+"/GBPUSD/M5"])
+	if id := acct + "/" + strat + "/EURUSD/M5"; got[id] != ipc.StateRunning {
+		t.Errorf("EURUSD (covered + alive pid) should be Running, got %s", got[id])
+	}
+	if id := acct + "/" + strat + "/GBPUSD/M5"; got[id] != ipc.StateStopped {
+		t.Errorf("GBPUSD (not in logical_systems) should stay Stopped, got %s", got[id])
 	}
 }
 
@@ -72,9 +105,7 @@ func TestReconcileGatesOnLogicalSystems(t *testing.T) {
 // symbol's own inference dir at its own timeframe). The row's bar-age reflects the STALEST leg, so a
 // dead leg surfaces in the fleet view even though the runner PID is alive (runner-level liveness, §15).
 func TestReconcileMultiTraderLegs(t *testing.T) {
-	root := t.TempDir()
-	live := filepath.Join(root, "live")
-	logb := filepath.Join(root, "log")
+	cfg, live, logb := box(t)
 	const runner = "basket-multi"
 
 	artefact := filepath.Join(live, "basket")
@@ -94,7 +125,7 @@ func TestReconcileMultiTraderLegs(t *testing.T) {
 	if err := os.MkdirAll(statusDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	status := fmt.Sprintf(`{"state":"running","pid":%d,"logical_systems":[{"symbol":"EURUSD","timeframe":5},{"symbol":"GBPUSD","timeframe":5}]}`, os.Getpid())
+	status := fmt.Sprintf(`{"state":"running","pid":%d,"account":"fxify.demo","logical_systems":[{"symbol":"EURUSD","timeframe":5},{"symbol":"GBPUSD","timeframe":5}]}`, os.Getpid())
 	if err := os.WriteFile(filepath.Join(statusDir, "status.json"), []byte(status), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -116,10 +147,10 @@ func TestReconcileMultiTraderLegs(t *testing.T) {
 	writeBar("EURUSD", fresh)
 	writeBar("GBPUSD", stale) // the stalest leg
 
-	systems := Reconcile(config.Config{LiveBase: live, LogBase: logb})
+	systems, _ := Reconcile(cfg)
 	var multi *ipc.System
 	for i := range systems {
-		if systems[i].SystemID == runner {
+		if systems[i].SystemID == acct+"/"+runner {
 			multi = &systems[i]
 		}
 	}
@@ -134,5 +165,100 @@ func TestReconcileMultiTraderLegs(t *testing.T) {
 	}
 	if !multi.LastBarTS.Equal(stale) {
 		t.Errorf("row bar-age should reflect the STALEST leg: got %s, want %s", multi.LastBarTS, stale)
+	}
+}
+
+// A running system is checked against its account folder: the account its status.json was written
+// under, and the terminal's login against the env file's LOGIN_ID.
+func TestReconcileFlagsAccountMismatch(t *testing.T) {
+	cases := []struct {
+		name, account, login, want string
+	}{
+		{"agrees", `"account":"fxify.demo",`, `"42"`, ""},
+		{"v1 runner", ``, `"42"`, "predates the account layout"},
+		{"wrong folder", `"account":"icmarkets.demo",`, `"42"`, "logs under account icmarkets.demo"},
+		{"wrong login", `"account":"fxify.demo",`, `"7"`, "logged into 7"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, live, logb := box(t)
+			if err := os.MkdirAll(filepath.Join(live, "s", "EURUSD", "5"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			_ = os.WriteFile(filepath.Join(live, "s", "EURUSD", "5", "run.py"), nil, 0o644)
+			writeStatus(t, filepath.Join(logb, "s"), fmt.Sprintf(`{"state":"running","pid":%d,%s"account_id":%s}`, os.Getpid(), tc.account, tc.login))
+			systems, _ := Reconcile(cfg)
+			if len(systems) != 1 {
+				t.Fatalf("systems = %+v", systems)
+			}
+			got := systems[0].AccountMismatch
+			if (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
+				t.Fatalf("mismatch = %q, want containing %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// An account folder without its env file, and a run.py outside any account folder, are problems.
+func TestReconcileReportsProblems(t *testing.T) {
+	cfg, _, _ := box(t)
+	for _, p := range []string{filepath.Join("deriv.live", "s", "X", "5"), "flat-multi"} {
+		dir := filepath.Join(cfg.LiveBase, p)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.WriteFile(filepath.Join(dir, "run.py"), nil, 0o644)
+	}
+	systems, problems := Reconcile(cfg)
+	if len(systems) != 1 || systems[0].Account != "deriv.live" {
+		t.Fatalf("systems = %+v", systems)
+	}
+	if len(problems) != 2 || problems[0].Path != "deriv.live" || problems[1].Path != "flat-multi" {
+		t.Fatalf("problems = %+v", problems)
+	}
+}
+
+// A runner (the Account Admin) reconciles like a multi-trader: its status.json sits at <log>/<account>/<folder>/
+// and its liveness legs come from its logical_systems[], so its per-minute heartbeat drives the bar age.
+func TestReconcileRunnerFolder(t *testing.T) {
+	cfg, live, logb := box(t)
+	if err := os.MkdirAll(filepath.Join(live, "_account_admin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(live, "_account_admin", "run.py"), nil, 0o644)
+	root := filepath.Join(logb, "_account_admin")
+	writeStatus(t, root, fmt.Sprintf(`{"state":"running","pid":%d,"account":"fxify.demo","account_id":"42",`+
+		`"logical_systems":[{"logical_system_id":"_account_admin/account/1","symbol":"account","timeframe":1}]}`, os.Getpid()))
+	inf := filepath.Join(root, "account", "1", "inference")
+	if err := os.MkdirAll(inf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	line := fmt.Sprintf(`{"event":"bar","asof_bar_ts":%q}`+"\n", now.Add(-time.Minute).Format(time.RFC3339Nano))
+	_ = os.WriteFile(filepath.Join(inf, "inference_"+now.Format("20060102")+".jsonl"), []byte(line), 0o644)
+
+	systems, problems := Reconcile(cfg)
+	if len(problems) != 0 || len(systems) != 1 {
+		t.Fatalf("systems=%+v problems=%+v", systems, problems)
+	}
+	s := systems[0]
+	if s.SystemID != "fxify.demo/_account_admin" || s.State != ipc.StateRunning || len(s.Legs) != 1 || s.Legs[0].Timeframe != "1" || s.LastBarTS.IsZero() {
+		t.Fatalf("admin row = %+v", s)
+	}
+}
+
+// An account whose env file lacks a session key is a problem: its systems cannot start.
+func TestReconcileReportsIncompleteEnv(t *testing.T) {
+	cfg, live, _ := box(t)
+	if err := os.WriteFile(filepath.Join(cfg.EnvDir, ".env."+acct), []byte("LOGIN_ID=42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(live, "s", "X", "5"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(live, "s", "X", "5", "run.py"), nil, 0o644)
+	_, problems := Reconcile(cfg)
+	if len(problems) != 1 || !strings.Contains(problems[0].Reason, "lacks TERMINAL_PATH, LOGIN_SERVER") {
+		t.Fatalf("problems = %+v", problems)
 	}
 }

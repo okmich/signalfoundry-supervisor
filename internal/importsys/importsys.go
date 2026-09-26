@@ -20,7 +20,9 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/okmich/signalfoundry-supervisor/internal/accounts"
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
+	"github.com/okmich/signalfoundry-supervisor/internal/discovery"
 	"github.com/okmich/signalfoundry-supervisor/internal/proc"
 	"github.com/okmich/signalfoundry-supervisor/internal/registry"
 )
@@ -41,13 +43,15 @@ var reservedPathChars = regexp.MustCompile(`[<>:"|?*\x00-\x1f]`)
 // renders it for confirmation before anything is written.
 type Plan struct {
 	SourceDir   string
+	Account     string // the account folder it is installed into (<broker>.<env>)
 	Multi       bool
+	Runner      bool     // installed directly under the account folder, named by config.json `runner`
 	Strategy    string   // strategy code (the path label)
 	Symbol      string   // single-trader only
 	Symbols     []string // multi-trader only
 	Timeframe   int      // single-trader only
 	SystemID    string   // matches discovery's system_id exactly
-	TargetDir   string   // absolute destination under LIVE_BASE
+	TargetDir   string   // absolute destination: LIVE_BASE/<account>/...
 	WillArchive bool     // target already exists -> the current copy is archived first
 }
 
@@ -59,14 +63,24 @@ type strategyEntry struct {
 
 type sysConfig struct {
 	Name       string          `json:"name"`
+	Runner     string          `json:"runner"` // a runner artefact, installed at <account>/<runner>
 	Strategy   *strategyEntry  `json:"strategy"`
 	Strategies []strategyEntry `json:"strategies"`
 }
 
-// BuildPlan validates the source directory and resolves the canonical LIVE_BASE target. It returns a
-// descriptive error (never panics) for any non-conforming input, and refuses if the resolved system
-// is currently running — an artefact must not be swapped under a live PID.
-func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
+// BuildPlan validates the source directory and resolves the canonical target under the account folder,
+// LIVE_BASE/<account>/... The account must have a broker env file (.env.<account> in ENV_DIR): the
+// folder decides which account the system trades, so an import into an account the box cannot log into
+// is refused here rather than at first start. It returns a descriptive error (never panics) for any
+// non-conforming input, and refuses if the resolved system is currently running — an artefact must not
+// be swapped under a live PID.
+func BuildPlan(cfg config.Config, account, sourceDir string) (Plan, error) {
+	if !accounts.Valid(account) {
+		return Plan{}, fmt.Errorf("account %q is not an env-file stem <broker>.<env> (e.g. fxify.demo)", account)
+	}
+	if info := accounts.Load(cfg.EnvDir, account); !info.EnvFound {
+		return Plan{}, fmt.Errorf("no broker env file for account %s (%s)", account, info.EnvFile)
+	}
 	// Strip control/NUL runes first: a clipboard paste can interleave \x00 bytes (a mis-decoded UTF-16
 	// path), which would otherwise reach filepath.Abs below and fail with an opaque "invalid argument".
 	src := strings.Map(func(r rune) rune {
@@ -107,7 +121,7 @@ func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
 		return Plan{}, fmt.Errorf("config.json is not valid JSON: %w", err)
 	}
 
-	p := Plan{SourceDir: src}
+	p := Plan{SourceDir: src, Account: account}
 	switch {
 	case len(sc.Strategies) > 0: // multi-trader (mirrors discovery's classification)
 		first := sc.Strategies[0]
@@ -124,8 +138,8 @@ func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
 			p.Symbols = append(p.Symbols, s.Symbol)
 		}
 		root := runnerStrategyRoot(first.Name)
-		p.Multi, p.Strategy, p.SystemID = true, first.Name, root
-		p.TargetDir = filepath.Join(cfg.LiveBase, root)
+		p.Multi, p.Strategy, p.SystemID = true, first.Name, account+"/"+root
+		p.TargetDir = filepath.Join(cfg.LiveBase, account, root)
 	case sc.Strategy != nil: // single-trader
 		s := sc.Strategy
 		if err := validateToken("strategy", s.Name); err != nil {
@@ -139,10 +153,17 @@ func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
 		}
 		strat, sym, tf := pathSafe(s.Name), pathSafe(s.Symbol), strconv.Itoa(s.Timeframe)
 		p.Strategy, p.Symbol, p.Timeframe = s.Name, s.Symbol, s.Timeframe
-		p.SystemID = strat + "/" + sym + "/" + tf
-		p.TargetDir = filepath.Join(cfg.LiveBase, strat, sym, tf)
+		p.SystemID = account + "/" + strat + "/" + sym + "/" + tf
+		p.TargetDir = filepath.Join(cfg.LiveBase, account, strat, sym, tf)
+	case sc.Runner != "": // a runner (e.g. the Account Admin): its folder is its identity and its log root
+		if err := validateToken("runner", sc.Runner); err != nil {
+			return Plan{}, err
+		}
+		name := pathSafe(sc.Runner)
+		p.Runner, p.Strategy, p.SystemID = true, name, account+"/"+name
+		p.TargetDir = filepath.Join(cfg.LiveBase, account, name)
 	default:
-		return Plan{}, fmt.Errorf("config.json classifies as neither single (a `strategy` object) nor multi (a non-empty `strategies[]`)")
+		return Plan{}, fmt.Errorf("config.json classifies as neither single (a `strategy` object), multi (a non-empty `strategies[]`) nor a runner (`runner`)")
 	}
 
 	if _, err := os.Stat(p.TargetDir); err == nil {
@@ -174,6 +195,12 @@ func (p Plan) Apply(cfg config.Config) (archivedTo string, err error) {
 		_ = os.RemoveAll(staging)
 		return "", fmt.Errorf("stage copy: %w", err)
 	}
+	if p.isAdmin() {
+		if err := carryAdminRuntime(p.TargetDir, staging); err != nil {
+			_ = os.RemoveAll(staging)
+			return "", fmt.Errorf("carry the Account Admin's governance files: %w", err)
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(p.TargetDir), 0o755); err != nil {
 		_ = os.RemoveAll(staging)
 		return "", err
@@ -200,29 +227,41 @@ func (p Plan) Apply(cfg config.Config) (archivedTo string, err error) {
 
 // Decommission retires an installed system: it archives the system's LIVE_BASE artefact dir to
 // .archive (the inverse of an import) so discovery drops it from the fleet, and is reversible. It
-// refuses if the system is running. Returns the archive location. The system_id is the relative path
-// under LIVE_BASE for both a single-trader (<strategy>/<symbol>/<timeframe>) and a multi-trader
-// (<strategy>-multi), so it maps straight to the artefact dir.
+// refuses if the system is running. Returns the archive location.
+//
+// The id must be one discovery currently reports, and the folder archived is that system's own artefact
+// dir. An id is never turned into a path by itself, so a crafted or stale id ("fxify.demo/../deriv.live",
+// "fxify.demo/.", a strategy folder holding several systems) can never archive an account, another
+// account's systems, or anything outside one system.
 func Decommission(cfg config.Config, systemID string) (archivedTo string, err error) {
 	if strings.TrimSpace(systemID) == "" {
 		return "", fmt.Errorf("no system id given")
 	}
+	cat, _, err := discovery.Scan(cfg.LiveBase)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("scan LIVE_BASE: %w", err)
+	}
+	var target string
+	for _, s := range cat {
+		if s.SystemID == systemID {
+			target = s.Dir
+			break
+		}
+	}
+	if target == "" {
+		return "", fmt.Errorf("system %q not found in LIVE_BASE", systemID)
+	}
+	if filepath.Base(target) == accounts.AdminFolder {
+		return "", fmt.Errorf("%s is the Account Admin: decommissioning it would take the account out of governance — "+
+			"follow the out-of-governance runbook (ACCOUNT_ADMIN_SPEC §8.3) instead", systemID)
+	}
 	if err := ensureNotRunning(cfg, systemID); err != nil {
 		return "", err
 	}
-	rel := filepath.FromSlash(systemID)
-	target := filepath.Join(cfg.LiveBase, rel)
-	// Containment: an exported rename must never escape LIVE_BASE or hit LIVE_BASE itself, even if a
-	// bogus id (".", "..", "../x") slips in — a system_id="." would otherwise archive the whole tree.
-	if liveAbs, aerr := filepath.Abs(cfg.LiveBase); aerr == nil {
-		if tAbs, terr := filepath.Abs(target); terr != nil {
-			return "", terr
-		} else if r, rerr := filepath.Rel(liveAbs, tAbs); rerr != nil || r == "." || strings.HasPrefix(r, "..") {
-			return "", fmt.Errorf("invalid system id %q (resolves outside LIVE_BASE)", systemID)
-		}
-	}
-	if info, statErr := os.Stat(target); statErr != nil || !info.IsDir() {
-		return "", fmt.Errorf("system %q not found in LIVE_BASE (%s)", systemID, target)
+	// Defense in depth: the artefact dir sits inside an account folder, below LIVE_BASE.
+	rel, err := filepath.Rel(cfg.LiveBase, target)
+	if acct, rest, _ := strings.Cut(filepath.ToSlash(rel), "/"); err != nil || !accounts.Valid(acct) || rest == "" {
+		return "", fmt.Errorf("system %q resolves outside an account folder (%s)", systemID, target)
 	}
 	ts := time.Now().UTC().Format("20060102T150405Z")
 	archivedTo = filepath.Join(cfg.LiveBase, ArchiveDir, rel, ts)
@@ -233,6 +272,43 @@ func Decommission(cfg config.Config, systemID string) (archivedTo string, err er
 		return "", fmt.Errorf("archive (rename target->archive): %w", err)
 	}
 	return archivedTo, nil
+}
+
+// isAdmin reports whether the plan installs an account's Account Admin.
+func (p Plan) isAdmin() bool { return p.Runner && p.Strategy == accounts.AdminFolder }
+
+// carryAdminRuntime makes the staged Admin copy hold exactly the governance files of the installed one: it
+// drops any the source brought (a directive is written only by the Admin that governs the account, never
+// shipped) and copies in the current directive, state and request inbox. writer.lock is not carried: the
+// import refuses while the Admin runs, so no lock is held. With no installed copy (first deployment) the
+// staged copy simply starts without them.
+func carryAdminRuntime(installed, staging string) error {
+	for _, name := range accounts.AdminRuntime {
+		if err := os.RemoveAll(filepath.Join(staging, name)); err != nil {
+			return err
+		}
+	}
+	for _, name := range accounts.AdminRuntime {
+		if name == "writer.lock" {
+			continue
+		}
+		src := filepath.Join(installed, name)
+		info, err := os.Stat(src)
+		if os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			err = copyTree(src, filepath.Join(staging, name))
+		} else {
+			err = copyFile(src, filepath.Join(staging, name))
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ensureNotRunning refuses if the registry shows the system_id bound to a live PID.

@@ -731,7 +731,7 @@ func (e *engine) accountGate(d discovery.System) (string, bool) {
 	if !info.EnvFound {
 		return fmt.Sprintf("no broker env file for account %s (%s) — refusing start", d.Account, info.EnvFile), false
 	}
-	if missing := info.MissingSessionKeys(); len(missing) > 0 {
+	if missing := info.MissingSessionKeys(d.APIKeys); len(missing) > 0 {
 		return fmt.Sprintf("%s lacks %s — refusing start", info.EnvFile, strings.Join(missing, ", ")), false
 	}
 	return "", true
@@ -807,8 +807,8 @@ func groupAccounts(systems []ipc.System, envs *accounts.Cache) []ipc.Account {
 		s := &systems[i]
 		if len(out) == 0 || out[len(out)-1].Name != s.Account {
 			info := envs.Get(s.Account)
-			out = append(out, ipc.Account{Name: s.Account, Login: info.Login, Server: info.Server, EnvMissing: !info.EnvFound,
-				EnvMissingKeys: info.MissingSessionKeys()})
+			out = append(out, ipc.Account{Name: s.Account, Login: info.Login, Server: info.Server,
+				Session: string(info.Session(s.APIKeys)), EnvMissing: !info.EnvFound, EnvMissingKeys: info.MissingSessionKeys(s.APIKeys)})
 		}
 		a := &out[len(out)-1]
 		a.SystemIDs = append(a.SystemIDs, s.SystemID)

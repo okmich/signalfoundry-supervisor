@@ -47,7 +47,7 @@ func Reconcile(cfg config.Config) ([]ipc.System, []ipc.Problem) {
 	for _, c := range cat {
 		env := envs.Get(c.Account)
 		if !missing[c.Account] {
-			if keys := env.MissingSessionKeys(); !env.EnvFound || len(keys) > 0 {
+			if keys := env.MissingSessionKeys(c.APIKeys); !env.EnvFound || len(keys) > 0 {
 				missing[c.Account] = true
 				reason := fmt.Sprintf("no broker env file %s — its systems cannot start", env.EnvFile)
 				if env.EnvFound {
@@ -60,6 +60,7 @@ func Reconcile(cfg config.Config) ([]ipc.System, []ipc.Problem) {
 		s := ipc.System{
 			SystemID:  c.SystemID,
 			Account:   c.Account,
+			APIKeys:   c.APIKeys,
 			Strategy:  c.Strategy,
 			Symbol:    c.Symbol,
 			Timeframe: c.Timeframe,

@@ -27,9 +27,13 @@ func TestLoadReadsOnlyIdentityKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := Load(dir, "fxify.demo")
+	if !got.defined["LOGIN_PASSWORD"] {
+		t.Error("a defined key should be known by name")
+	}
+	got.defined = nil
 	want := Info{Name: "fxify.demo", EnvFile: filepath.Join(dir, ".env.fxify.demo"), EnvFound: true,
 		Login: "123", Server: "FXIFY-Demo", Broker: "fxify", TerminalPath: `C:\MT5\terminal64.exe`}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Load = %+v, want %+v", got, want)
 	}
 }
@@ -51,16 +55,36 @@ func TestList(t *testing.T) {
 }
 
 func TestMissingSessionKeys(t *testing.T) {
-	if got := (Info{EnvFound: true, Login: "1"}).MissingSessionKeys(); !reflect.DeepEqual(got, []string{"TERMINAL_PATH", "LOGIN_SERVER"}) {
+	if got := (Info{EnvFound: true, Login: "1"}).MissingSessionKeys(nil); !reflect.DeepEqual(got, []string{"TERMINAL_PATH", "LOGIN_SERVER"}) {
 		t.Errorf("MT5 missing = %v", got)
 	}
-	if got := (Info{EnvFound: true, Login: "1", Server: "S", TerminalPath: "T"}).MissingSessionKeys(); got != nil {
+	if got := (Info{EnvFound: true, Login: "1", Server: "S", TerminalPath: "T"}).MissingSessionKeys(nil); got != nil {
 		t.Errorf("complete MT5 = %v", got)
 	}
-	if got := (Info{EnvFound: true, IBHost: "127.0.0.1"}).MissingSessionKeys(); got != nil {
+	if got := (Info{EnvFound: true, IBHost: "127.0.0.1"}).MissingSessionKeys(nil); got != nil {
 		t.Errorf("IB needs no MT5 keys, got %v", got)
 	}
-	if got := (Info{}).MissingSessionKeys(); got != nil {
+	if got := (Info{}).MissingSessionKeys(nil); got != nil {
 		t.Errorf("a missing file is reported as missing, not as missing keys: %v", got)
+	}
+}
+
+// An account whose configs name API credentials is an API account: it needs exactly those keys (with a value),
+// and none of MT5's.
+func TestAPISession(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".env.bybit.demo"), []byte("API_KEY=k\nAPI_SECRET=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info := Load(dir, "bybit.demo")
+	keys := []string{"API_KEY", "API_SECRET"}
+	if got := info.Session(keys); got != SessionAPI {
+		t.Errorf("Session = %s, want api", got)
+	}
+	if got := info.MissingSessionKeys(keys); !reflect.DeepEqual(got, []string{"API_SECRET"}) {
+		t.Errorf("missing = %v, want the empty API_SECRET only", got)
+	}
+	if got := info.Session(nil); got != SessionMT5 {
+		t.Errorf("without config-named credentials the account is MT5, got %s", got)
 	}
 }

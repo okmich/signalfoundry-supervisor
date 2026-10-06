@@ -91,7 +91,7 @@ from the TUI on a Deriv-Demo terminal, and it is looking good.
 - **Broker-session start gate (§13/§14) — scaffold** — the engine refuses to start/restart a system
   whose broker session is `red`, and the fleet view shows per-account session health. It also refuses a
   start whose account env file is missing or lacks a session key (`TERMINAL_PATH`, `LOGIN_ID`,
-  `LOGIN_SERVER`), naming what is missing. Resolution is
+  `LOGIN_SERVER` for MT5; for an API account, the credential env vars its configs name), naming what is missing. Resolution is
   pluggable (`internal/session`): a per-broker `Adapter` (the real MT5/IB probe, not yet built) with a
   file-backed operator override (`session_health.json`) as the stand-in + maintenance lockout. With no
   adapter/override, sessions are `unknown` and the gate allows (absence of a probe never blocks).

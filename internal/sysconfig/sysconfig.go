@@ -12,6 +12,9 @@
 //
 // Each kind writes its timeframe differently, and each runner converts it to minutes before logging; the tables
 // below mirror those conversions exactly (okmich_quant_mt5 / okmich_quant_ib / okmich_quant_crypto timeframe_utils).
+//
+// A config may also name the environment variables its runner reads API credentials from (APIKeys): the
+// session is then an API-key one, checked against the account's env file instead of MT5's terminal + login.
 package sysconfig
 
 import (
@@ -45,6 +48,9 @@ type Config struct {
 	Name    string   // the top-level system name
 	Multi   bool     // a non-empty strategies[] (LOGGING_CONTRACT §7.1: runner root <strategy>-multi)
 	Sleeves []Sleeve // every strategies[] entry, or the single `strategy`
+	// APIKeys are the environment variables the runner reads its API credentials from — the names, never the
+	// values. Non-empty marks an API-key session; empty for MT5 and IB, whose sessions are a terminal or a gateway.
+	APIKeys []string
 }
 
 // ErrUnclassified: the config has neither a `strategy` object nor a non-empty `strategies[]`.
@@ -64,6 +70,13 @@ type rawConfig struct {
 	Strategies  []rawSleeve     `json:"strategies"`
 	Venue       json.RawMessage `json:"venue"`
 	IBContracts json.RawMessage `json:"ib_contracts"`
+}
+
+// rawVenue is the credential part of okmich_quant_crypto CryptoVenueConfig: env var NAMES, defaults as there.
+type rawVenue struct {
+	APIKeyEnv   *string `json:"api_key_env"`
+	SecretEnv   *string `json:"secret_env"`
+	PasswordEnv *string `json:"password_env"`
 }
 
 // Classify reads the kind, the single/multi shape and each sleeve's logged symbol WITHOUT interpreting timeframes.
@@ -108,6 +121,9 @@ func classify(raw []byte) (Config, []rawSleeve, error) {
 		return Config{}, nil, err
 	}
 	c := Config{Kind: kind, Name: rc.Name, Multi: multi}
+	if kind == KindCrypto {
+		c.APIKeys = apiKeys(rc.Venue)
+	}
 	for _, s := range sleeves {
 		c.Sleeves = append(c.Sleeves, Sleeve{Name: s.Name, Symbol: loggedSymbol(kind, s)})
 	}
@@ -130,6 +146,28 @@ func detectKind(rc rawConfig, sleeves []rawSleeve) (Kind, error) {
 		return KindIB, nil
 	}
 	return KindMT5, nil
+}
+
+// apiKeys lists the credential env vars a crypto venue names, falling back to CryptoVenueConfig's defaults
+// (CRYPTO_API_KEY, CRYPTO_API_SECRET; no passphrase). A venue the Supervisor cannot read yields the defaults:
+// the runner's own validation, not discovery, rejects a malformed venue.
+func apiKeys(venue json.RawMessage) []string {
+	v := rawVenue{}
+	if present(venue) {
+		_ = json.Unmarshal(venue, &v)
+	}
+	keys := []string{orDefault(v.APIKeyEnv, "CRYPTO_API_KEY"), orDefault(v.SecretEnv, "CRYPTO_API_SECRET")}
+	if v.PasswordEnv != nil && *v.PasswordEnv != "" {
+		keys = append(keys, *v.PasswordEnv)
+	}
+	return keys
+}
+
+func orDefault(s *string, def string) string {
+	if s == nil || *s == "" {
+		return def
+	}
+	return *s
 }
 
 func present(m json.RawMessage) bool {

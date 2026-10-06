@@ -31,7 +31,7 @@ const (
 
 // terminalCap is the ≤10 logical-systems-per-broker-terminal blast-radius cap (§7). One logical
 // system = one PID = one MT5 terminal IPC slot; a multi-trader's symbols are legs, shown beside the
-// cap but never counted against it.
+// cap but never counted against it. Only an MT5 account has a terminal, so only its header shows the cap.
 const terminalCap = 10
 
 var (
@@ -607,20 +607,28 @@ func (m model) systemRow(s ipc.System, selected bool) string {
 	return row
 }
 
-// accountHeader is the blast-radius subheader for an account folder (§7): one env file = one terminal +
-// one login. It shows the account, its login and server, the N/10 cap (live logical systems = PIDs =
-// terminal IPC slots, reddened when over cap — reported, never enforced), the leg count when a
-// multi-trader makes legs ≠ systems, the session health, and a warning when the env file is missing.
+// accountHeader is the blast-radius subheader for an account folder (§7): one env file = one broker session.
+// It shows the account, its login and server (MT5) or "API" (an API-key session), the live logical systems
+// — against the N/10 cap for an MT5 terminal (PIDs = terminal IPC slots, reddened when over cap — reported,
+// never enforced) — the leg count when a multi-trader makes legs ≠ systems, the session health, and a
+// warning when the env file is missing or lacks a session key.
 func accountHeader(a ipc.Account, name string) string {
 	id := name
+	if a.Session == "api" {
+		id += " · API"
+	}
 	if a.Login != "" {
 		id += " · " + a.Login
 	}
 	if a.Server != "" {
 		id += " @ " + a.Server
 	}
-	capStr, capStyle := fmt.Sprintf("%d/%d systems", a.LogicalSystems, terminalCap), dimStyle
-	if a.LogicalSystems > terminalCap {
+	capped := a.Session == "" || a.Session == "mt5" // "": a fleet state from an engine predating Session
+	capStr, capStyle := fmt.Sprintf("%d systems", a.LogicalSystems), dimStyle
+	if capped {
+		capStr = fmt.Sprintf("%d/%d systems", a.LogicalSystems, terminalCap)
+	}
+	if capped && a.LogicalSystems > terminalCap {
 		capStr += "  OVER CAP"
 		capStyle = alertStyle
 	}

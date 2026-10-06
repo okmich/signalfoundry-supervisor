@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/accounts"
@@ -31,6 +32,10 @@ type System struct {
 	Runner bool
 	Dir    string // the artefact directory
 	RunPy  string // path to run.py (what the Supervisor spawns)
+	// APIKeys are the credential env vars the ACCOUNT's system configs name (sysconfig.Config.APIKeys, merged
+	// across the account folder), stamped on every system in it — a runner without a config included — because
+	// the session belongs to the account. Non-empty makes it an API account (accounts.SessionAPI).
+	APIKeys []string
 }
 
 // Problem is something under LIVE_BASE that looks like a system but cannot be run: a run.py outside an
@@ -78,6 +83,7 @@ func scanAccount(liveBase, account string) ([]System, []Problem) {
 	accDir := filepath.Join(liveBase, account)
 	var out []System
 	var problems []Problem
+	apiKeys := map[string]bool{}
 	_ = filepath.WalkDir(accDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil //nolint:nilerr // skip unreadable entries, keep scanning
@@ -93,7 +99,15 @@ func scanAccount(liveBase, account string) ([]System, []Problem) {
 		}
 		dir := filepath.Dir(path)
 		rel, _ := filepath.Rel(accDir, dir)
-		if code, symbols, ok := readMultiConfig(dir); ok {
+		cfg, hasCfg := readConfig(dir)
+		for _, k := range cfg.APIKeys {
+			apiKeys[k] = true
+		}
+		if hasCfg && cfg.Multi {
+			code, symbols := cfg.Sleeves[0].Name, make([]string, 0, len(cfg.Sleeves))
+			for _, s := range cfg.Sleeves {
+				symbols = append(symbols, s.Symbol)
+			}
 			runner := runnerStrategyRoot(code)
 			out = append(out, System{
 				SystemID: account + "/" + runner, Account: account, Strategy: code, RunnerStrategy: runner,
@@ -122,6 +136,16 @@ func scanAccount(liveBase, account string) ([]System, []Problem) {
 		})
 		return nil
 	})
+	if len(apiKeys) > 0 {
+		keys := make([]string, 0, len(apiKeys))
+		for k := range apiKeys {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for i := range out {
+			out[i].APIKeys = keys
+		}
+	}
 	return out, problems
 }
 
@@ -144,24 +168,18 @@ func hasRunPy(dir string) bool {
 	return found
 }
 
-// readMultiConfig reports a multi-trader iff dir/config.json has a non-empty strategies[]; it returns
-// the strategy code and the per-symbol list as the runner logs it (MT5 / IB / crypto adapted by sysconfig,
-// e.g. crypto's market_symbol "BTC/USDT:USDT" -> "BTC/USDT-USDT"). Timeframes are not interpreted here, so a
-// system is never dropped from its runner root over one. A missing/unreadable config or an empty
-// strategies[] (a single-trader's config carries a singular `strategy`) yields ok=false.
-func readMultiConfig(dir string) (code string, symbols []string, ok bool) {
+// readConfig classifies dir/config.json. A multi-trader is one with a non-empty strategies[]: its sleeves carry
+// the strategy code and the per-symbol list as the runner logs it (MT5 / IB / crypto adapted by sysconfig, e.g.
+// crypto's market_symbol "BTC/USDT:USDT" -> "BTC/USDT-USDT"); a single-trader's config carries a singular
+// `strategy`. Timeframes are not interpreted here, so a system is never dropped from its runner root over one.
+// A missing, unreadable or unclassifiable config yields ok=false.
+func readConfig(dir string) (sysconfig.Config, bool) {
 	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err != nil {
-		return "", nil, false
+		return sysconfig.Config{}, false
 	}
 	c, err := sysconfig.Classify(b)
-	if err != nil || !c.Multi {
-		return "", nil, false
-	}
-	for _, s := range c.Sleeves {
-		symbols = append(symbols, s.Symbol)
-	}
-	return c.Sleeves[0].Name, symbols, true
+	return c, err == nil
 }
 
 // runnerStrategyRoot appends the statutory -multi suffix (idempotently), mirroring the framework's

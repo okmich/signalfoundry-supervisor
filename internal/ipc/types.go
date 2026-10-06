@@ -24,8 +24,15 @@ const (
 type FleetState struct {
 	Engine    EngineInfo `json:"engine"`
 	UpdatedAt time.Time  `json:"updated_at"`
-	Terminals []Terminal `json:"terminals"` // blast-radius grouping (§7)
-	Systems   []System   `json:"systems"`
+	Accounts  []Account  `json:"accounts"`           // one group per account folder, stopped systems included (§7)
+	Systems   []System   `json:"systems"`            // ordered by account, then system id
+	Problems  []Problem  `json:"problems,omitempty"` // things under LIVE_BASE that cannot run (flat layout, no env file)
+}
+
+// Problem is a LIVE_BASE entry the engine will not run, surfaced to the operator.
+type Problem struct {
+	Path   string `json:"path"` // relative to LIVE_BASE
+	Reason string `json:"reason"`
 }
 
 type EngineInfo struct {
@@ -35,13 +42,19 @@ type EngineInfo struct {
 	Alerts    bool      `json:"alerts"` // Telegram alerting enabled (creds present)
 }
 
-// Terminal groups the logical systems that share one broker session/account (die together, §7).
-type Terminal struct {
-	BrokerSessionID string   `json:"broker_session_id"`
-	Broker          string   `json:"broker,omitempty"`
-	Account         string   `json:"account_id"`
+// Account groups the systems of one account folder, <live_base>/<account>. One env file = one terminal +
+// one login, so they share a broker session and die together (§7). Built from the folder, so a group
+// exists — with its stopped systems — even when nothing in it runs.
+type Account struct {
+	Name            string   `json:"account"`                     // the folder: the env-file stem, e.g. fxify.demo
+	Login           string   `json:"login,omitempty"`             // LOGIN_ID from .env.<account>
+	Server          string   `json:"server,omitempty"`            // LOGIN_SERVER from .env.<account>
+	EnvMissing      bool     `json:"env_missing,omitempty"`       // no .env.<account> in ENV_DIR: its systems cannot start
+	EnvMissingKeys  []string `json:"env_missing_keys,omitempty"`  // session keys .env.<account> lacks: its systems cannot start
+	BrokerSessionID string   `json:"broker_session_id,omitempty"` // from a running system's status.json
+	Broker          string   `json:"broker,omitempty"`            // status.json broker (for the session probe)
 	SystemIDs       []string `json:"system_ids"`
-	LogicalSystems  int      `json:"logical_systems"`  // the ≤10/terminal cap unit: ONE PID = one logical system = one MT5 terminal IPC slot (mt5.initialize binds per-process), whatever its symbol count
+	LogicalSystems  int      `json:"logical_systems"`  // live PIDs: the ≤10/terminal cap unit: ONE PID = one logical system = one MT5 terminal IPC slot (mt5.initialize binds per-process), whatever its symbol count
 	Legs            int      `json:"legs"`             // symbols carried across those PIDs — account concentration (shared margin, magic-number namespace), NOT a cap
 	Health          string   `json:"health,omitempty"` // broker-session precondition health (green|red|unknown, §13)
 }
@@ -66,24 +79,31 @@ type LogPaths struct {
 }
 
 type System struct {
-	SystemID    string      `json:"system_id"`
-	Strategy    string      `json:"strategy"`
-	Symbol      string      `json:"symbol"`
-	Timeframe   string      `json:"timeframe"`         // the directory label, e.g. "M5" (not minutes)
-	Multi       bool        `json:"multi,omitempty"`   // a multi-trader runner (one PID, N symbols, §16)
-	Symbols     []string    `json:"symbols,omitempty"` // multi only: the logical-system symbols it carries
-	Legs        []SystemLeg `json:"legs,omitempty"`    // multi only: per-symbol liveness clocks (§15 runner-level liveness)
-	State       State       `json:"state"`
-	PID         int         `json:"pid,omitempty"`
-	StartToken  string      `json:"runner_start_token,omitempty"`
-	Broker      string      `json:"broker,omitempty"`
-	Account     string      `json:"account_id,omitempty"`
-	SessionID   string      `json:"broker_session_id,omitempty"`
-	StartedAt   time.Time   `json:"started_at"` // runner start time (status.json), for the details view
-	LastBarTS   time.Time   `json:"last_bar_ts"`
-	LastBarAgeS float64     `json:"last_bar_age_s"`   // liveness: seconds since last bar
-	Wedged      bool        `json:"wedged,omitempty"` // alive but JSONL stale past threshold (§15); orthogonal to State
-	LogPaths    LogPaths    `json:"log_paths"`
+	SystemID   string      `json:"system_id"`
+	Strategy   string      `json:"strategy"`
+	Symbol     string      `json:"symbol"`
+	Timeframe  string      `json:"timeframe"`         // the directory label, e.g. "M5" (not minutes)
+	Multi      bool        `json:"multi,omitempty"`   // a multi-trader runner (one PID, N symbols, §16)
+	Symbols    []string    `json:"symbols,omitempty"` // multi only: the logical-system symbols it carries
+	Legs       []SystemLeg `json:"legs,omitempty"`    // multi only: per-symbol liveness clocks (§15 runner-level liveness)
+	State      State       `json:"state"`
+	PID        int         `json:"pid,omitempty"`
+	StartToken string      `json:"runner_start_token,omitempty"`
+	Account    string      `json:"account"`              // the account folder (env-file stem)
+	Broker     string      `json:"broker,omitempty"`     // status.json broker
+	AccountID  string      `json:"account_id,omitempty"` // status.json account_id: the terminal's login
+	SessionID  string      `json:"broker_session_id,omitempty"`
+	// StartError is why the last start of this system failed (the runner exited during startup or never reached
+	// running), with the last line of its console output; "" once a start succeeds or a new one is issued.
+	StartError string `json:"start_error,omitempty"`
+	// AccountMismatch explains why the running system does not match its account folder (status.json
+	// account, or the terminal login vs the env file's LOGIN_ID); "" when they agree or cannot be checked.
+	AccountMismatch string    `json:"account_mismatch,omitempty"`
+	StartedAt       time.Time `json:"started_at"` // runner start time (status.json), for the details view
+	LastBarTS       time.Time `json:"last_bar_ts"`
+	LastBarAgeS     float64   `json:"last_bar_age_s"`   // liveness: seconds since last bar
+	Wedged          bool      `json:"wedged,omitempty"` // alive but JSONL stale past threshold (§15); orthogonal to State
+	LogPaths        LogPaths  `json:"log_paths"`
 }
 
 // Command is what the TUI drops for the engine: commands/<id>.json.

@@ -55,15 +55,16 @@ func ctrlcSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_CONSOLE}
 }
 
-// Spawn launches a system's run.py in its OWN console (CREATE_NEW_CONSOLE), so it can be targeted
-// individually by SendCtrlC without disturbing siblings. The console opens MINIMIZED and unfocused
-// (SW_SHOWMINNOACTIVE) so a fleet start does not blanket the desktop with foreground windows — it
-// stays a taskbar entry the operator can restore. We go through CreateProcess directly because
-// os/exec only exposes HideWindow (SW_HIDE, fully hidden); a hidden console is harder to inspect and
-// loses the taskbar entry. Returns the child PID; the process handle is intentionally not retained —
-// control is by PID and the child must outlive the supervisor (FLEET_SUPERVISOR_SPEC §6).
-func Spawn(python, runPy string, args ...string) (int, error) {
-	cmdline := windows.ComposeCommandLine(append([]string{python, runPy}, args...))
+// Spawn starts `python -u <runPy>` in its own console (CREATE_NEW_CONSOLE: the Ctrl+C control of §9 needs one),
+// opened minimized (SW_SHOWMINNOACTIVE) so a fleet start does not blanket the desktop with foreground windows. We go
+// through CreateProcess directly because os/exec only exposes HideWindow (SW_HIDE, fully hidden). The child inherits
+// the engine's environment. Returns the child PID; the process handle is intentionally not retained — control is by
+// PID and the child must outlive the supervisor (FLEET_SUPERVISOR_SPEC §6).
+//
+// console, when set, is a file that receives the child's stdout and stderr (unbuffered, -u), so a runner that dies
+// before it can write its own log still leaves its traceback behind. Its console window then stays empty.
+func Spawn(python, runPy, console string, args ...string) (int, error) {
+	cmdline := windows.ComposeCommandLine(append([]string{python, "-u", runPy}, args...))
 	clPtr, err := windows.UTF16PtrFromString(cmdline)
 	if err != nil {
 		return 0, err
@@ -76,15 +77,48 @@ func Spawn(python, runPy string, args ...string) (int, error) {
 	// minimized without stealing focus from the foreground window.
 	si := &windows.StartupInfo{Flags: windows.STARTF_USESHOWWINDOW, ShowWindow: windows.SW_SHOWMINNOACTIVE}
 	si.Cb = uint32(unsafe.Sizeof(*si))
+	inherit := false
+	if console != "" {
+		out, in, err := consoleHandles(console)
+		if err != nil {
+			return 0, err
+		}
+		defer windows.CloseHandle(out)
+		defer windows.CloseHandle(in)
+		si.Flags |= windows.STARTF_USESTDHANDLES
+		si.StdInput, si.StdOutput, si.StdErr = in, out, out
+		inherit = true
+	}
 	var pi windows.ProcessInformation
-	// lpEnvironment=nil -> inherit the engine's environment (so the child sees OKMICH_QUANT_* roots).
-	if err := windows.CreateProcess(nil, clPtr, nil, nil, false,
-		windows.CREATE_NEW_CONSOLE, nil, dirPtr, si, &pi); err != nil {
+	if err := windows.CreateProcess(nil, clPtr, nil, nil, inherit, windows.CREATE_NEW_CONSOLE, nil, dirPtr, si, &pi); err != nil {
 		return 0, err
 	}
 	_ = windows.CloseHandle(pi.Thread)
 	_ = windows.CloseHandle(pi.Process) // not retained — closing the handle does not terminate the child
 	return int(pi.ProcessId), nil
+}
+
+// consoleHandles opens the capture file for writing and NUL for reading, both inheritable, so they can become
+// the child's standard handles. The file is shared for reading, so the TUI can tail it while the child writes.
+func consoleHandles(path string) (out, in windows.Handle, err error) {
+	sa := &windows.SecurityAttributes{InheritHandle: 1}
+	sa.Length = uint32(unsafe.Sizeof(*sa))
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	out, err = windows.CreateFile(p, windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		sa, windows.CREATE_ALWAYS, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return 0, 0, fmt.Errorf("open console capture %s: %w", path, err)
+	}
+	nul, _ := windows.UTF16PtrFromString("NUL")
+	in, err = windows.CreateFile(nul, windows.GENERIC_READ, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, sa, windows.OPEN_EXISTING, 0, 0)
+	if err != nil {
+		_ = windows.CloseHandle(out)
+		return 0, 0, err
+	}
+	return out, in, nil
 }
 
 // Alive reports whether pid is a currently-running process.

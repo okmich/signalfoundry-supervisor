@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/okmich/signalfoundry-supervisor/internal/accounts"
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
 	"github.com/okmich/signalfoundry-supervisor/internal/contract"
 	"github.com/okmich/signalfoundry-supervisor/internal/discovery"
@@ -39,12 +41,13 @@ const (
 // (it derives state purely from status.json), so the engine overlays these to show the in-flight
 // state until status.json catches up, and to drive the stop/start deadlines.
 type transition struct {
-	action   string    // "stop" | "start" | "restart"
-	phase    string    // restart only: "stopping" then "starting"
-	pid      int       // the control PID the action targets / the spawned PID
-	token    string    // status.json start token at fire time (PID-reuse context)
-	runPy    string    // start/restart: the run.py to (re)launch
-	deadline time.Time // current phase deadline
+	action   string           // "stop" | "start" | "restart"
+	phase    string           // restart only: "stopping" then "starting"
+	pid      int              // the control PID the action targets / the spawned PID
+	token    string           // status.json start token at fire time (PID-reuse context)
+	sys      discovery.System // start/restart: the system to (re)launch
+	console  string           // start/restart: the console capture of the current launch
+	deadline time.Time        // current phase deadline
 }
 
 // identity is the (pid, create-time, start-token) the engine last confirmed for a Running system —
@@ -62,6 +65,8 @@ type engine struct {
 	transitions map[string]*transition // system_id -> in-flight action
 	notifier    *notify.Telegram       // ops alerts (orphan/wedged/crash/hard-kill); no-op without creds
 	wedged      map[string]bool        // system_id currently flagged wedged (edge-trigger the alert)
+	mismatched  map[string]string      // system_id -> its current account mismatch (edge-trigger the alert)
+	startErrors map[string]string      // system_id -> why its last start failed (published until the next start)
 	identities  map[string]identity    // system_id -> confirmed (pid, create-time) for PID-reuse guard
 	sessions    *session.Checker       // broker-session precondition gate (§13/§14)
 	lastPrune   time.Time              // throttles command-file housekeeping
@@ -95,6 +100,8 @@ func Run(cfg config.Config) error {
 		cfg:         cfg,
 		transitions: map[string]*transition{},
 		wedged:      map[string]bool{},
+		mismatched:  map[string]string{},
+		startErrors: map[string]string{},
 		identities:  map[string]identity{},
 		notifier:    notify.FromEnvFile(cfg.NotifierEnvPath()),
 		sessions:    session.NewChecker(cfg.StateDir),
@@ -128,17 +135,20 @@ func Run(cfg config.Config) error {
 		case <-tick.C:
 			now := time.Now().UTC()
 			settings := e.loadSettings()
-			systems := state.Reconcile(cfg)
-			e.reconcileIdentities(systems)          // PID-reuse guard + registry re-attach baseline (§9/§12)
-			e.processCommands(systems)              // fire new actions, register transitions, write results
-			e.applyTransitions(systems)             // overlay in-flight state, drive deadlines, clear on completion
-			e.checkLiveness(systems, now, settings) // flag wedged (alive but stale JSONL), alert on the edge
-			terminals := groupTerminals(systems)    // blast-radius grouping (§7); orders systems by terminal
-			e.probeSessions(terminals)              // broker-session health for each terminal (§13)
+			systems, problems := state.Reconcile(cfg)
+			e.reconcileIdentities(systems)                                 // PID-reuse guard + registry re-attach baseline (§9/§12)
+			e.processCommands(systems)                                     // fire new actions, register transitions, write results
+			e.applyTransitions(systems)                                    // overlay in-flight state, drive deadlines, clear on completion
+			e.applyStartErrors(systems)                                    // a failed start stays visible (Crashed + why) until the next start
+			e.checkLiveness(systems, now, settings)                        // flag wedged (alive but stale JSONL), alert on the edge
+			e.checkAccounts(systems)                                       // alert when a running system disagrees with its account folder
+			accts := groupAccounts(systems, accounts.NewCache(cfg.EnvDir)) // blast-radius grouping (§7); orders systems by account
+			e.probeSessions(accts)                                         // broker-session health for each account's terminal (§13)
 			fs := ipc.FleetState{
-				Engine:    ipc.EngineInfo{PID: os.Getpid(), StartedAt: startedAt, Version: Version, Alerts: e.notifier.Enabled()},
-				Systems:   systems,
-				Terminals: terminals,
+				Engine:   ipc.EngineInfo{PID: os.Getpid(), StartedAt: startedAt, Version: Version, Alerts: e.notifier.Enabled()},
+				Systems:  systems,
+				Accounts: accts,
+				Problems: problems,
 			}
 			if err := ipc.Publish(cfg.FleetStatePath(), fs); err != nil {
 				log.Println("engine: publish:", err)
@@ -233,12 +243,17 @@ func (e *engine) doStart(c ipc.Command, s *ipc.System, d discovery.System) ipc.C
 		res.Accepted, res.Error = false, msg
 		return res
 	}
-	pid, err := e.launch(c.SystemID, d.RunPy)
+	if msg, ok := e.accountGate(d); !ok {
+		res.Accepted, res.Error = false, msg
+		return res
+	}
+	pid, console, err := e.launch(d)
 	if err != nil {
 		res.Accepted, res.Error = false, fmt.Sprintf("spawn failed (python=%s): %v", e.cfg.Python, err)
 		return res
 	}
-	e.transitions[c.SystemID] = &transition{action: "start", phase: "starting", pid: pid, runPy: d.RunPy, deadline: time.Now().UTC().Add(e.cfg.StartTimeout)}
+	delete(e.startErrors, c.SystemID)
+	e.transitions[c.SystemID] = &transition{action: "start", phase: "starting", pid: pid, sys: d, console: console, deadline: time.Now().UTC().Add(e.cfg.StartTimeout)}
 	log.Printf("engine: start spawned %s (pid=%d, python=%s)", c.SystemID, pid, e.cfg.Python)
 	res.Accepted, res.Outcome = true, "starting"
 	return res
@@ -261,22 +276,28 @@ func (e *engine) doRestart(c ipc.Command, s *ipc.System, d discovery.System) ipc
 		res.Accepted, res.Error = false, msg
 		return res
 	}
+	if msg, ok := e.accountGate(d); !ok { // likewise if the relaunch could not find its broker env
+		res.Accepted, res.Error = false, msg
+		return res
+	}
 	if s.State == ipc.StateRunning && s.PID != 0 && proc.Alive(s.PID) {
 		if err := proc.Stop(s.PID); err != nil {
 			res.Accepted, res.Error = false, "stop (for restart) failed: "+err.Error()
 			return res
 		}
-		e.transitions[c.SystemID] = &transition{action: "restart", phase: "stopping", pid: s.PID, token: s.StartToken, runPy: d.RunPy, deadline: time.Now().UTC().Add(e.cfg.StopTimeout)}
+		delete(e.startErrors, c.SystemID)
+		e.transitions[c.SystemID] = &transition{action: "restart", phase: "stopping", pid: s.PID, token: s.StartToken, sys: d, deadline: time.Now().UTC().Add(e.cfg.StopTimeout)}
 		log.Printf("engine: restart (stopping) %s (pid=%d)", c.SystemID, s.PID)
 		res.Accepted, res.Outcome = true, "restarting"
 		return res
 	}
-	pid, err := e.launch(c.SystemID, d.RunPy)
+	pid, console, err := e.launch(d)
 	if err != nil {
 		res.Accepted, res.Error = false, fmt.Sprintf("spawn failed (python=%s): %v", e.cfg.Python, err)
 		return res
 	}
-	e.transitions[c.SystemID] = &transition{action: "restart", phase: "starting", pid: pid, runPy: d.RunPy, deadline: time.Now().UTC().Add(e.cfg.StartTimeout)}
+	delete(e.startErrors, c.SystemID)
+	e.transitions[c.SystemID] = &transition{action: "restart", phase: "starting", pid: pid, sys: d, console: console, deadline: time.Now().UTC().Add(e.cfg.StartTimeout)}
 	log.Printf("engine: restart (spawn, was %s) %s (pid=%d)", s.State, c.SystemID, pid)
 	res.Accepted, res.Outcome = true, "restarting"
 	return res
@@ -369,10 +390,12 @@ func (e *engine) resolveStart(id string, s *ipc.System, tr *transition, now time
 		delete(e.transitions, id)
 		return
 	}
-	if now.After(tr.deadline) {
-		s.State = ipc.StateCrashed
-		e.alert(fmt.Sprintf("%s: did not reach running within %s — start failed (crashed)", id, e.cfg.StartTimeout))
-		delete(e.transitions, id)
+	switch {
+	case !proc.Alive(tr.pid): // the runner exited before it reported running: fail now, not at the deadline
+		e.failStart(id, s, tr, "exited during startup")
+		return
+	case now.After(tr.deadline):
+		e.failStart(id, s, tr, fmt.Sprintf("did not reach running within %s", e.cfg.StartTimeout))
 		return
 	}
 	s.State = overlay
@@ -393,14 +416,14 @@ func (e *engine) resolveRestartStopping(id string, s *ipc.System, tr *transition
 		s.State = ipc.StateRestarting
 		return
 	}
-	pid, err := e.launch(id, tr.runPy)
+	pid, console, err := e.launch(tr.sys)
 	if err != nil {
 		s.State = ipc.StateCrashed
 		log.Printf("engine: restart %s relaunch failed: %v", id, err)
 		delete(e.transitions, id)
 		return
 	}
-	tr.pid, tr.phase, tr.deadline = pid, "starting", now.Add(e.cfg.StartTimeout)
+	tr.pid, tr.phase, tr.console, tr.deadline = pid, "starting", console, now.Add(e.cfg.StartTimeout)
 	s.State = ipc.StateRestarting
 	log.Printf("engine: restart %s relaunched (pid=%d)", id, pid)
 }
@@ -653,8 +676,88 @@ func resolveInterpreter(python string) (string, error) {
 // authoritative control identity (real interpreter PID + create-time + start-token) is recorded by
 // reconcileIdentities once the system reaches Running via status.json — not at spawn time, since the
 // spawned PID may be a launcher/shim, not the interpreter that writes status.json.
-func (e *engine) launch(_, runPy string) (int, error) {
-	return proc.Spawn(e.cfg.Python, runPy)
+//
+// The runner inherits the engine's environment unchanged; nothing about its account is passed — it loads its own
+// broker env, and the framework mirrors the account folder it is deployed in. Its console output (stdout and
+// stderr) goes to <log_base>\<account>\<runner root>\z_console_<UTC>.log, beside the log it writes itself, so a
+// runner that dies before it can log still leaves the reason behind. Returns the PID and the capture's path.
+func (e *engine) launch(d discovery.System) (int, string, error) {
+	dir := filepath.Join(e.cfg.LogBase, d.Account, d.RunnerStrategy)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, "", err
+	}
+	console := filepath.Join(dir, "z_console_"+time.Now().UTC().Format("20060102T150405Z")+".log")
+	pid, err := proc.Spawn(e.cfg.Python, d.RunPy, console)
+	return pid, console, err
+}
+
+// failStart marks a start that did not reach running: Crashed now, with the last line of the runner's console
+// output as the reason, alerted once and kept visible (applyStartErrors) until the next start of the system.
+func (e *engine) failStart(id string, s *ipc.System, tr *transition, why string) {
+	msg := why
+	if last := proc.LastLine(tr.console, 240); last != "" {
+		msg += ": " + last
+	}
+	if tr.console != "" {
+		msg += " (output: " + tr.console + ")"
+	}
+	e.startErrors[id] = msg
+	s.State, s.StartError = ipc.StateCrashed, msg
+	e.alert(fmt.Sprintf("%s: start failed — %s", id, msg))
+	delete(e.transitions, id)
+}
+
+// applyStartErrors keeps a failed start visible: status.json never recorded the dead runner, so without this
+// the row would fall back to Stopped on the next tick and the reason would be lost. A running system (someone
+// started it by hand) or a new start clears it.
+func (e *engine) applyStartErrors(systems []ipc.System) {
+	for i := range systems {
+		s := &systems[i]
+		msg, ok := e.startErrors[s.SystemID]
+		switch {
+		case !ok:
+		case s.State == ipc.StateRunning:
+			delete(e.startErrors, s.SystemID)
+		case s.State == ipc.StateStopped || s.State == ipc.StateCrashed:
+			s.State, s.StartError = ipc.StateCrashed, msg
+		}
+	}
+}
+
+// accountGate refuses a start/restart whose account has no broker env file, or one without the session
+// keys its runners need: the runner would fail at startup anyway, and the refusal names what is missing.
+func (e *engine) accountGate(d discovery.System) (string, bool) {
+	info := accounts.Load(e.cfg.EnvDir, d.Account)
+	if !info.EnvFound {
+		return fmt.Sprintf("no broker env file for account %s (%s) — refusing start", d.Account, info.EnvFile), false
+	}
+	if missing := info.MissingSessionKeys(); len(missing) > 0 {
+		return fmt.Sprintf("%s lacks %s — refusing start", info.EnvFile, strings.Join(missing, ", ")), false
+	}
+	return "", true
+}
+
+// checkAccounts alerts, once per episode, when a running system disagrees with its account folder
+// (state.accountMismatch): it may be trading an account other than the one its folder claims.
+func (e *engine) checkAccounts(systems []ipc.System) {
+	live := map[string]bool{}
+	for _, s := range systems {
+		live[s.SystemID] = true
+		prev := e.mismatched[s.SystemID]
+		switch {
+		case s.AccountMismatch != "" && s.AccountMismatch != prev:
+			e.mismatched[s.SystemID] = s.AccountMismatch
+			e.alert(fmt.Sprintf("%s: ACCOUNT MISMATCH — %s", s.SystemID, s.AccountMismatch))
+		case s.AccountMismatch == "" && prev != "":
+			delete(e.mismatched, s.SystemID)
+			log.Printf("engine: %s account mismatch cleared", s.SystemID)
+		}
+	}
+	for id := range e.mismatched {
+		if !live[id] {
+			delete(e.mismatched, id)
+		}
+	}
 }
 
 func isLiveOrInFlight(st ipc.State) bool {
@@ -666,7 +769,7 @@ func isLiveOrInFlight(st ipc.State) bool {
 }
 
 func scanCatalog(liveBase string) map[string]discovery.System {
-	cat, _ := discovery.Scan(liveBase)
+	cat, _, _ := discovery.Scan(liveBase)
 	m := make(map[string]discovery.System, len(cat))
 	for _, c := range cat {
 		m[c.SystemID] = c
@@ -682,64 +785,60 @@ func indexByID(systems []ipc.System) map[string]*ipc.System {
 	return m
 }
 
-// groupTerminals builds the blast-radius grouping (§7): running systems that share a broker session
-// die together. It orders `systems` in place by terminal (idle/non-running last) so the view can
-// render them grouped, and counts the two per-terminal numbers that a single "logical systems"
-// count used to conflate:
-//   LogicalSystems — one per PID. mt5.initialize() binds one terminal IPC slot per PROCESS whatever
-//     its symbol count, so a 4-symbol multi-trader is ONE logical system. This is the ≤10 cap unit.
-//   Legs — one per symbol. The account-concentration figure (shared margin, magic-number namespace);
-//     reported for the operator, never capped — it is not a terminal resource.
-func groupTerminals(systems []ipc.System) []ipc.Terminal {
+// groupAccounts builds the blast-radius grouping (§7) from the account folders: one group per account,
+// whatever its systems' states, so stopped systems stay with their account. It orders `systems` in
+// place by account then id so the view can render them grouped, and counts the two per-account numbers
+// that a single "logical systems" count used to conflate — over LIVE systems only, since those are what
+// occupy the terminal:
+//
+//	LogicalSystems — one per PID. mt5.initialize() binds one terminal IPC slot per PROCESS whatever
+//	  its symbol count, so a 4-symbol multi-trader is ONE logical system. This is the ≤10 cap unit.
+//	Legs — one per symbol. The account-concentration figure (shared margin, magic-number namespace);
+//	  reported for the operator, never capped — it is not a terminal resource.
+func groupAccounts(systems []ipc.System, envs *accounts.Cache) []ipc.Account {
 	sort.SliceStable(systems, func(i, j int) bool {
-		if ki, kj := groupKey(systems[i]), groupKey(systems[j]); ki != kj {
-			return ki < kj
+		if systems[i].Account != systems[j].Account {
+			return systems[i].Account < systems[j].Account
 		}
 		return systems[i].SystemID < systems[j].SystemID
 	})
-	byID := map[string]*ipc.Terminal{}
-	var order []string
+	var out []ipc.Account
 	for i := range systems {
 		s := &systems[i]
-		if s.SessionID == "" {
+		if len(out) == 0 || out[len(out)-1].Name != s.Account {
+			info := envs.Get(s.Account)
+			out = append(out, ipc.Account{Name: s.Account, Login: info.Login, Server: info.Server, EnvMissing: !info.EnvFound,
+				EnvMissingKeys: info.MissingSessionKeys()})
+		}
+		a := &out[len(out)-1]
+		a.SystemIDs = append(a.SystemIDs, s.SystemID)
+		if !isLiveOrInFlight(s.State) {
 			continue
 		}
-		t := byID[s.SessionID]
-		if t == nil {
-			t = &ipc.Terminal{BrokerSessionID: s.SessionID, Broker: s.Broker, Account: s.Account}
-			byID[s.SessionID] = t
-			order = append(order, s.SessionID)
+		if a.BrokerSessionID == "" && s.SessionID != "" {
+			a.BrokerSessionID, a.Broker = s.SessionID, s.Broker
 		}
-		t.SystemIDs = append(t.SystemIDs, s.SystemID)
-		t.LogicalSystems++ // one process, one IPC slot — a multi-trader is ONE logical system, not N
+		a.LogicalSystems++ // one process, one IPC slot — a multi-trader is ONE logical system, not N
 		legs := 1
 		if n := len(s.Symbols); s.Multi && n > 0 {
 			legs = n
 		}
-		t.Legs += legs
-	}
-	out := make([]ipc.Terminal, 0, len(order))
-	for _, id := range order {
-		out = append(out, *byID[id])
+		a.Legs += legs
 	}
 	return out
 }
 
-// groupKey orders systems by broker session; those without one (idle / not running) sort last.
-func groupKey(s ipc.System) string {
-	if s.SessionID == "" {
-		return "\xff"
-	}
-	return s.SessionID
-}
-
-// probeSessions stamps each terminal with its broker-session health (§13) for the fleet view.
-func (e *engine) probeSessions(terminals []ipc.Terminal) {
-	for i := range terminals {
+// probeSessions stamps each account with its terminal's broker-session health (§13) for the fleet view.
+// An account with nothing running has no session id to probe and stays unknown.
+func (e *engine) probeSessions(accts []ipc.Account) {
+	for i := range accts {
+		if accts[i].BrokerSessionID == "" {
+			continue
+		}
 		st := e.sessions.Probe(session.Ref{
-			Broker: terminals[i].Broker, Account: terminals[i].Account, SessionID: terminals[i].BrokerSessionID,
+			Broker: accts[i].Broker, Account: accts[i].Login, SessionID: accts[i].BrokerSessionID,
 		})
-		terminals[i].Health = string(st.Health)
+		accts[i].Health = string(st.Health)
 	}
 }
 
@@ -749,7 +848,7 @@ func (e *engine) probeSessions(terminals []ipc.Terminal) {
 // core's; this gate fires on sessions the supervisor can see (running terminals, restarts, or an
 // operator override). Returns the operator-facing reason and false when the start must be refused.
 func (e *engine) sessionGate(s *ipc.System) (string, bool) {
-	ok, st := e.sessions.Allowed(session.Ref{Broker: s.Broker, Account: s.Account, SessionID: s.SessionID})
+	ok, st := e.sessions.Allowed(session.Ref{Broker: s.Broker, Account: s.AccountID, SessionID: s.SessionID})
 	if ok {
 		return "", true
 	}

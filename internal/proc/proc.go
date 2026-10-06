@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // CtrlCMain is the `supervisor ctrlc --pid N` helper: it borrows the target's console and fires
@@ -45,4 +46,26 @@ func Stop(pid int) error {
 		return fmt.Errorf("ctrlc helper failed: %v: %s", err, out)
 	}
 	return nil
+}
+
+// LastLine returns the last non-empty line of a (console capture) file, trimmed to max runes — for a runner
+// that died during startup, the line that says why (e.g. the exception of its traceback). "" if none.
+func LastLine(path string, max int) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	if len(b) > 64*1024 {
+		b = b[len(b)-64*1024:]
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if l := strings.TrimSpace(lines[i]); l != "" {
+			if r := []rune(l); len(r) > max {
+				return string(r[:max-1]) + "…"
+			}
+			return l
+		}
+	}
+	return ""
 }

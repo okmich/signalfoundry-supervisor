@@ -83,8 +83,8 @@ func TestLastBarTSSkipsNonBarTail(t *testing.T) {
 }
 
 func TestInferenceDirIsPathSafe(t *testing.T) {
-	got := InferenceDir("L", "crypto_rsi_bybit-multi", "BTC/USDT-USDT", "15")
-	want := filepath.Join("L", "crypto_rsi_bybit-multi", "BTC_USDT-USDT", "15", "inference")
+	got := InferenceDir("L", "bybit.demo", "crypto_rsi_bybit-multi", "BTC/USDT-USDT", "15")
+	want := filepath.Join("L", "bybit.demo", "crypto_rsi_bybit-multi", "BTC_USDT-USDT", "15", "inference")
 	if got != want {
 		t.Fatalf("InferenceDir = %q, want %q", got, want)
 	}

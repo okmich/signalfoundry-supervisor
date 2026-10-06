@@ -163,6 +163,13 @@ type importState struct {
 type tickMsg time.Time
 type errMsg struct{ err error }
 
+// importDoneMsg carries the result of an async system install back to the event loop.
+type importDoneMsg struct {
+	systemID string
+	archived string
+	err      error
+}
+
 // pane discriminates the two log panes of the details view.
 const (
 	paneSys = iota // left: z_system_log.log
@@ -209,6 +216,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.infPane.path, m.infPane.lines, m.infPane.err = msg.path, msg.lines, msg.err
 				}
 			}
+		}
+		return m, nil
+	case importDoneMsg:
+		switch {
+		case msg.err != nil:
+			m.status = "import failed: " + msg.err.Error()
+		case msg.archived != "":
+			m.status = fmt.Sprintf("imported %s (previous archived → %s)", msg.systemID, filepath.Base(msg.archived))
+		default:
+			m.status = "imported " + msg.systemID
 		}
 		return m, nil
 	case tickMsg:
@@ -320,16 +337,14 @@ func (m model) handleImportKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if im.plan != nil { // confirm phase
 		switch k.String() {
 		case "y", "Y":
-			archived, err := im.plan.Apply(m.cfg)
-			switch {
-			case err != nil:
-				m.status = "import failed: " + err.Error()
-			case archived != "":
-				m.status = fmt.Sprintf("imported %s (previous archived → %s)", im.plan.SystemID, filepath.Base(archived))
-			default:
-				m.status = "imported " + im.plan.SystemID
-			}
+			// Run the copy/archive off the event loop — a large model artefact must not freeze the UI.
+			plan, cfg := *im.plan, m.cfg
 			m.importing = nil
+			m.status = "installing " + plan.SystemID + "…"
+			return m, func() tea.Msg {
+				archived, err := plan.Apply(cfg)
+				return importDoneMsg{systemID: plan.SystemID, archived: archived, err: err}
+			}
 		case "esc":
 			m.importing, m.status = nil, "import cancelled"
 		default: // any other key -> back to editing to amend the path

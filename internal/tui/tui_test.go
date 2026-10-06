@@ -514,10 +514,20 @@ func TestImportInstallsValidatedSystem(t *testing.T) {
 		t.Fatalf("confirm view should show the system id and an install hint:\n%s", out)
 	}
 
-	press(key("y")) // install
+	tm, cmd := m.handleKey(key("y")) // confirm -> async install
+	m = tm.(model)
 	if m.importing != nil {
-		t.Error("dialog should close after a successful install")
+		t.Error("dialog should close once the install is confirmed")
 	}
+	if cmd == nil || !strings.Contains(m.status, "installing") {
+		t.Fatalf("confirm should return an install command and show progress, status=%q", m.status)
+	}
+	msg := cmd() // run the install off the event loop, then feed its result back through Update
+	if _, ok := msg.(importDoneMsg); !ok {
+		t.Fatalf("install cmd returned %T, want importDoneMsg", msg)
+	}
+	tm, _ = m.Update(msg)
+	m = tm.(model)
 	if !strings.Contains(m.status, "imported fxify.demo/rsi2/EURUSD/5") {
 		t.Errorf("status = %q, want an imported result", m.status)
 	}

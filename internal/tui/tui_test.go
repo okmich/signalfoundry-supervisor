@@ -914,3 +914,11 @@ func TestStartErrorIsShown(t *testing.T) {
 		t.Fatalf("the details should say why:\n%s", out)
 	}
 }
+
+// An API account has no terminal: its header says API and drops the MT5 ≤10 cap.
+func TestAccountHeaderAPISession(t *testing.T) {
+	hdr := accountHeader(ipc.Account{Name: "bybit.demo", Session: "api", LogicalSystems: 1}, "bybit.demo")
+	if !strings.Contains(hdr, "bybit.demo · API") || !strings.Contains(hdr, "1 systems") || strings.Contains(hdr, "/10") {
+		t.Errorf("API header = %q", hdr)
+	}
+}

@@ -429,3 +429,19 @@ func TestStartFailsFastWithTheReason(t *testing.T) {
 		t.Errorf("a running system clears its start error")
 	}
 }
+
+// An API account's start is gated on the credential names its configs declare, never on MT5's keys.
+func TestStartGatedOnAPIKeys(t *testing.T) {
+	e := testEngine(t)
+	if err := os.WriteFile(filepath.Join(e.cfg.EnvDir, ".env.bybit.demo"), []byte("API_KEY=k\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := discovery.System{Account: "bybit.demo", RunPy: "run.py", APIKeys: []string{"API_KEY", "API_SECRET"}}
+	if msg, ok := e.accountGate(d); ok || !strings.Contains(msg, "lacks API_SECRET") || strings.Contains(msg, "TERMINAL_PATH") {
+		t.Errorf("want an API_SECRET refusal, got ok=%v msg=%q", ok, msg)
+	}
+	accts := groupAccounts([]ipc.System{{SystemID: "bybit.demo/x", Account: "bybit.demo", APIKeys: d.APIKeys}}, accounts.NewCache(e.cfg.EnvDir))
+	if a := accts[0]; a.Session != "api" || len(a.EnvMissingKeys) != 1 || a.EnvMissingKeys[0] != "API_SECRET" {
+		t.Errorf("account = %+v, want an api session missing API_SECRET", a)
+	}
+}

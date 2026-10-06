@@ -3,8 +3,8 @@
 // the first level under both LIVE_BASE and LOG_BASE (ACCOUNT_LAYOUT_CHANGE_PLAN, LOGGING_CONTRACT §10).
 //
 // The env files hold credentials. This package reads ONLY the identity keys the supervisor needs to
-// label and check an account (LOGIN_ID, LOGIN_SERVER, BROKER_NAME, TERMINAL_PATH, IB_HOST) and never
-// retains or exposes anything else.
+// label and check an account (LOGIN_ID, LOGIN_SERVER, BROKER_NAME, TERMINAL_PATH, IB_HOST), plus which keys
+// are defined at all — never their values — and retains or exposes nothing else.
 package accounts
 
 import (
@@ -33,30 +33,64 @@ var namePattern = regexp.MustCompile(`^[a-z0-9_]+\.[a-z0-9_]+$`)
 // an account folder.
 func Valid(name string) bool { return namePattern.MatchString(name) }
 
+// Session is how an account's runners reach their broker: the protocol decides which env keys they need.
+type Session string
+
+const (
+	SessionMT5 Session = "mt5" // a desktop terminal + login: TERMINAL_PATH, LOGIN_ID, LOGIN_SERVER
+	SessionIB  Session = "ib"  // a gateway: IB_HOST
+	SessionAPI Session = "api" // API credentials, in the env vars the account's system configs name
+)
+
 // Info is what the supervisor knows about one account from its env file.
 type Info struct {
 	Name         string
 	EnvFile      string // <env_dir>/.env.<name>
 	EnvFound     bool
-	Login        string // LOGIN_ID
-	Server       string // LOGIN_SERVER
-	Broker       string // BROKER_NAME
-	TerminalPath string // TERMINAL_PATH
-	IBHost       string // IB_HOST: marks an IB account (gateway session, no terminal or login in the file)
+	Login        string          // LOGIN_ID
+	Server       string          // LOGIN_SERVER
+	Broker       string          // BROKER_NAME
+	TerminalPath string          // TERMINAL_PATH
+	IBHost       string          // IB_HOST: marks an IB account (gateway session, no terminal or login in the file)
+	defined      map[string]bool // every key with a non-empty value: names only, so a config-named credential can be checked
+}
+
+// Session is the account's protocol. apiKeys are the credential env vars its systems' configs name
+// (sysconfig.Config.APIKeys, across the account): any makes it an API account, whatever else the file holds.
+// Otherwise IB_HOST makes it IB, and anything else is MT5.
+func (i Info) Session(apiKeys []string) Session {
+	switch {
+	case len(apiKeys) > 0:
+		return SessionAPI
+	case i.IBHost != "":
+		return SessionIB
+	}
+	return SessionMT5
 }
 
 // MissingSessionKeys lists the keys the account's env file must carry for its runners to reach their broker
 // session but does not: TERMINAL_PATH, LOGIN_ID and LOGIN_SERVER for an MT5 account; nothing beyond IB_HOST
-// for an IB account. The engine refuses a start while any is missing (FLEET_SUPERVISOR_SPEC §13), so the
-// operator sees which key is absent instead of a runner crashing on its first line.
-func (i Info) MissingSessionKeys() []string {
-	if !i.EnvFound || i.IBHost != "" {
+// for an IB account; every apiKeys name for an API account. The engine refuses a start while any is missing
+// (FLEET_SUPERVISOR_SPEC §13), so the operator sees which key is absent instead of a runner crashing on its
+// first line.
+func (i Info) MissingSessionKeys(apiKeys []string) []string {
+	if !i.EnvFound {
 		return nil
 	}
 	var out []string
-	for _, kv := range [][2]string{{"TERMINAL_PATH", i.TerminalPath}, {"LOGIN_ID", i.Login}, {"LOGIN_SERVER", i.Server}} {
-		if kv[1] == "" {
-			out = append(out, kv[0])
+	switch i.Session(apiKeys) {
+	case SessionIB:
+	case SessionAPI:
+		for _, k := range apiKeys {
+			if !i.defined[k] {
+				out = append(out, k)
+			}
+		}
+	case SessionMT5:
+		for _, kv := range [][2]string{{"TERMINAL_PATH", i.TerminalPath}, {"LOGIN_ID", i.Login}, {"LOGIN_SERVER", i.Server}} {
+			if kv[1] == "" {
+				out = append(out, kv[0])
+			}
 		}
 	}
 	return out
@@ -76,11 +110,15 @@ func Load(envDir, name string) Info {
 	}
 	defer f.Close()
 	info.EnvFound = true
+	info.defined = map[string]bool{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		key, val, ok := parseLine(sc.Text())
 		if !ok {
 			continue
+		}
+		if val != "" {
+			info.defined[key] = true
 		}
 		switch key {
 		case "LOGIN_ID":

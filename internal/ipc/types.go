@@ -49,6 +49,7 @@ type Account struct {
 	Name            string   `json:"account"`                     // the folder: the env-file stem, e.g. fxify.demo
 	Login           string   `json:"login,omitempty"`             // LOGIN_ID from .env.<account>
 	Server          string   `json:"server,omitempty"`            // LOGIN_SERVER from .env.<account>
+	Session         string   `json:"session"`                     // how its runners reach the broker: mt5 | ib | api (accounts.Session)
 	EnvMissing      bool     `json:"env_missing,omitempty"`       // no .env.<account> in ENV_DIR: its systems cannot start
 	EnvMissingKeys  []string `json:"env_missing_keys,omitempty"`  // session keys .env.<account> lacks: its systems cannot start
 	BrokerSessionID string   `json:"broker_session_id,omitempty"` // from a running system's status.json
@@ -90,6 +91,7 @@ type System struct {
 	PID        int         `json:"pid,omitempty"`
 	StartToken string      `json:"runner_start_token,omitempty"`
 	Account    string      `json:"account"`              // the account folder (env-file stem)
+	APIKeys    []string    `json:"api_keys,omitempty"`   // credential env vars the account's configs name (names only): an API account
 	Broker     string      `json:"broker,omitempty"`     // status.json broker
 	AccountID  string      `json:"account_id,omitempty"` // status.json account_id: the terminal's login
 	SessionID  string      `json:"broker_session_id,omitempty"`

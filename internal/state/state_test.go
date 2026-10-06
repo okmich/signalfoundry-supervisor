@@ -318,3 +318,26 @@ func TestReconcileReportsIncompleteEnv(t *testing.T) {
 		t.Fatalf("problems = %+v", problems)
 	}
 }
+
+// An API account is checked for the credential names its configs declare, not for MT5's terminal and login.
+func TestReconcileChecksAPIAccountKeys(t *testing.T) {
+	cfg, _, _ := box(t)
+	const api = "bybit.demo"
+	dir := filepath.Join(cfg.LiveBase, api, "crypto_rsi")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "run.py"), nil, 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"venue":{"exchange_id":"bybit","api_key_env":"API_KEY",`+
+		`"secret_env":"API_SECRET"},"strategies":[{"name":"crypto_rsi","market_symbol":"BTC/USDT:USDT","timeframe":"15m"}]}`), 0o644)
+	env := filepath.Join(cfg.EnvDir, ".env."+api)
+
+	_ = os.WriteFile(env, []byte("API_KEY=k\nAPI_SECRET=s\n"), 0o644)
+	if _, problems := Reconcile(cfg); len(problems) != 0 {
+		t.Fatalf("a complete API account is no problem, got %+v", problems)
+	}
+	_ = os.WriteFile(env, []byte("API_KEY=k\n"), 0o644)
+	if _, problems := Reconcile(cfg); len(problems) != 1 || !strings.HasSuffix(problems[0].Reason, "lacks API_SECRET — its systems cannot start") {
+		t.Fatalf("problems = %+v, want API_SECRET named", problems)
+	}
+}

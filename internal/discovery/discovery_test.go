@@ -3,6 +3,7 @@ package discovery
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -133,5 +134,30 @@ func TestScanFindsRunnerFolders(t *testing.T) {
 	s := cat[0]
 	if s.SystemID != "fxify.demo/_account_admin" || !s.Runner || s.Multi || s.RunnerStrategy != "_account_admin" || s.Account != acct {
 		t.Fatalf("runner = %+v", s)
+	}
+}
+
+// The credential names an account's configs declare are stamped on every system in it — its runner (the
+// Account Admin, no config) included — and on no other account's.
+func TestScanStampsAccountAPIKeys(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "bybit.demo", "crypto_rsi", "run.py"), "")
+	write(t, filepath.Join(root, "bybit.demo", "crypto_rsi", "config.json"),
+		`{"venue":{"exchange_id":"bybit","api_key_env":"API_KEY","secret_env":"API_SECRET"},"strategies":[{"name":"crypto_rsi","market_symbol":"BTC/USDT:USDT","timeframe":"15m"}]}`)
+	write(t, filepath.Join(root, "bybit.demo", "_account_admin", "run.py"), "")
+	write(t, filepath.Join(root, acct, "s", "EURUSD", "5", "run.py"), "")
+
+	cat, _, err := Scan(root)
+	if err != nil || len(cat) != 3 {
+		t.Fatal(err, cat)
+	}
+	for _, s := range cat {
+		var want []string
+		if s.Account == "bybit.demo" {
+			want = []string{"API_KEY", "API_SECRET"}
+		}
+		if !reflect.DeepEqual(s.APIKeys, want) {
+			t.Errorf("%s APIKeys = %v, want %v", s.SystemID, s.APIKeys, want)
+		}
 	}
 }

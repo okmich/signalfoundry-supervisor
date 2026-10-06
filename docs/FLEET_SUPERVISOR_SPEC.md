@@ -284,7 +284,7 @@ So in the MVP, **startup is an operator action through the Supervisor**, matchin
 > human starts MT5 terminals / IB Gateway and logs in → opens Supervisor → Supervisor shows each broker session's health → operator starts systems whose session is **green** → Supervisor refuses to start a system whose session is
 > **red**.
 
-- **Account env pre-check (implemented).** A stopped system has no live session to probe, but its account folder already says which session it will need: `.env.<account>` names the terminal and login before anything starts. The Supervisor refuses a start or restart when that file is missing, or lacks a session key its runners need (`TERMINAL_PATH`, `LOGIN_ID`, `LOGIN_SERVER` for MT5; an IB account is recognised by `IB_HOST`), naming what is missing. The account is also listed as a problem in the fleet view. This turns "the runner crashed on its first line" into a refusal that says why.
+- **Account env pre-check (implemented).** A stopped system has no live session to probe, but its account folder already says which session it will need: `.env.<account>` names the terminal and login before anything starts. The Supervisor refuses a start or restart when that file is missing, or lacks a session key its runners need (`TERMINAL_PATH`, `LOGIN_ID`, `LOGIN_SERVER` for MT5; an IB account is recognised by `IB_HOST`; an API account — one whose system configs name API credential env vars, e.g. a crypto `venue.api_key_env` / `secret_env` / `password_env` — needs exactly those names defined), naming what is missing. The account is also listed as a problem in the fleet view. This turns "the runner crashed on its first line" into a refusal that says why.
 
 Deferring auto-start also defers the *adopt-on-restart-at-boot* problem (distinct from the always-running-Supervisor re-attach of [§12](#12-supervisor-restart-and-child-re-attach)), removing the two thorniest pieces from the MVP.
 
@@ -343,7 +343,7 @@ Reuses OPS-guide roots ([OPS §3.1](../../signalfoundry-lab/docs/ops/OPS_REFEREN
 <log_base>\<account>\<root>\<symbol>\<timeframe>\inference\inference_<YYYYMMDD>.jsonl   # per-leg bar/breaker stream (liveness + behavior)
 ```
 
-- **Accounts.** Every top-level folder of `<live_base>` named like `<broker>.<env>` is an account; its env file is `<env_dir>\.env.<account>`. The Supervisor reads only identity keys from it (`LOGIN_ID`, `LOGIN_SERVER`, `BROKER_NAME`, `TERMINAL_PATH`, `IB_HOST`), never secrets. Dot-folders (`.archive`, `.staging`) are the importer's own.
+- **Accounts.** Every top-level folder of `<live_base>` named like `<broker>.<env>` is an account; its env file is `<env_dir>\.env.<account>`. The Supervisor reads only identity keys from it (`LOGIN_ID`, `LOGIN_SERVER`, `BROKER_NAME`, `TERMINAL_PATH`, `IB_HOST`) and which keys are defined, never secrets. An account is MT5, IB or API by its session (§13); only an MT5 account's header shows the ≤10-per-terminal cap. Dot-folders (`.archive`, `.staging`) are the importer's own.
 - **`system_id`** — a stable identifier per PID-level unit, always prefixed by its account:
   - a single-trader: `<account>/<strategy>/<symbol>/<timeframe>` (its path);
   - a multi-trader: `<account>/<strategy>-multi` (one PID, N symbols; stopped as a **unit**, per-symbol stop is not offered, by construction);

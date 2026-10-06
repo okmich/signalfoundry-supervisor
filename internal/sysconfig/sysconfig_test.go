@@ -3,6 +3,7 @@ package sysconfig
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -139,5 +140,31 @@ func TestRejections(t *testing.T) {
 	legacyIB := strings.Replace(ibSingle, `"timeframe":"5 mins"`, `"timeframe":5`, 1)
 	if _, err := Parse([]byte(legacyIB)); err == nil || !strings.Contains(err.Error(), "strategy.timeframe") {
 		t.Errorf("legacy IB int timeframe: %v", err)
+	}
+}
+
+// A crypto config names its credential env vars in venue (an API-key session); absent names fall back to the
+// runner's defaults. MT5 and IB configs name none.
+func TestAPIKeys(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want []string
+	}{
+		{`{"venue":{"exchange_id":"bybit","api_key_env":"API_KEY","secret_env":"API_SECRET"},"strategy":{"name":"s","market_symbol":"BTC/USDT","timeframe":"1h"}}`,
+			[]string{"API_KEY", "API_SECRET"}},
+		{`{"venue":{"exchange_id":"okx","password_env":"OKX_PASS"},"strategy":{"name":"s","market_symbol":"BTC/USDT","timeframe":"1h"}}`,
+			[]string{"CRYPTO_API_KEY", "CRYPTO_API_SECRET", "OKX_PASS"}},
+		{`{"strategy":{"name":"s","market_symbol":"BTC/USDT","timeframe":"1h"}}`, []string{"CRYPTO_API_KEY", "CRYPTO_API_SECRET"}},
+		{mt5SingleH1, nil},
+		{ibSingle, nil},
+	}
+	for _, tc := range cases {
+		c, err := Classify([]byte(tc.raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(c.APIKeys, tc.want) {
+			t.Errorf("%s: APIKeys = %v, want %v", tc.raw, c.APIKeys, tc.want)
+		}
 	}
 }

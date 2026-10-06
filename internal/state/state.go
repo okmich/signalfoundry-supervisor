@@ -189,8 +189,10 @@ func runnerCovers(rs contract.RunnerStatus, symbol string) bool {
 	if len(rs.LogicalSystems) == 0 {
 		return true
 	}
+	// Compare as path labels: the row symbol is a folder name, status.json carries the logged symbol (crypto's
+	// "BTC/USDT-USDT" lives in folder "BTC_USDT-USDT").
 	for _, ls := range rs.LogicalSystems {
-		if ls.Symbol == symbol {
+		if contract.PathSafe(ls.Symbol) == contract.PathSafe(symbol) {
 			return true
 		}
 	}

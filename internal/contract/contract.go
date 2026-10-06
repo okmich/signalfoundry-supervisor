@@ -43,9 +43,18 @@ func StatusPath(logBase, account, runnerStrategy string) string {
 	return filepath.Join(logBase, account, runnerStrategy, "status.json")
 }
 
-// InferenceDir is <logBase>/<account>/<runnerStrategy>/<symbol>/<timeframe>/inference.
+// InferenceDir is <logBase>/<account>/<runnerStrategy>/<symbol>/<timeframe>/inference, with the symbol made one
+// path component exactly as the runner does — so a logged symbol such as crypto's "BTC/USDT-USDT" (from
+// status.json) resolves to the "BTC_USDT-USDT" folder the runner writes, not to nested folders. Already-safe
+// labels pass through unchanged.
 func InferenceDir(logBase, account, runnerStrategy, symbol, timeframe string) string {
-	return filepath.Join(logBase, account, runnerStrategy, symbol, timeframe, "inference")
+	return filepath.Join(logBase, account, runnerStrategy, PathSafe(symbol), timeframe, "inference")
+}
+
+// PathSafe mirrors okmich_quant_core logging.identity._path_safe: replace path separators, then trim. Internal
+// spaces are kept so a label matches the framework's log folder byte-for-byte ("Volatility 75 Index").
+func PathSafe(s string) string {
+	return strings.TrimSpace(strings.NewReplacer("/", "_", "\\", "_").Replace(s))
 }
 
 // ReadStatus loads a runner-root status.json.

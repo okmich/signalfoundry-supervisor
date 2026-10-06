@@ -168,6 +168,62 @@ func TestReconcileMultiTraderLegs(t *testing.T) {
 	}
 }
 
+// TestReconcileCryptoMultiTraderLegsArePathSafe: status.json carries crypto's LOGGED symbol ("BTC/USDT-USDT"),
+// while the runner writes its bars under the path-safe folder ("BTC_USDT-USDT"), exactly as
+// okmich_quant_core's _path_safe. Joining the raw symbol would look in nested BTC/USDT-USDT folders and never
+// find a bar, leaving the runner unjudged for wedging.
+func TestReconcileCryptoMultiTraderLegsArePathSafe(t *testing.T) {
+	cfg, live, logb := box(t)
+	const runner = "crypto_rsi_bybit-multi"
+
+	artefact := filepath.Join(live, runner)
+	if err := os.MkdirAll(artefact, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(artefact, "run.py"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sysCfg := `{"name":"crypto_rsi_demo_bybit","venue":{"exchange_id":"bybit"},"strategies":[
+		{"name":"crypto_rsi_bybit","market_symbol":"BTC/USDT:USDT","timeframe":"15m"},
+		{"name":"crypto_rsi_bybit","market_symbol":"ETH/USDT:USDT","timeframe":"15m"}]}`
+	if err := os.WriteFile(filepath.Join(artefact, "config.json"), []byte(sysCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	statusDir := filepath.Join(logb, runner)
+	writeStatus(t, statusDir, fmt.Sprintf(`{"state":"running","pid":%d,"account":"fxify.demo","account_id":"42",`+
+		`"logical_systems":[{"symbol":"BTC/USDT-USDT","timeframe":15},{"symbol":"ETH/USDT-USDT","timeframe":15}]}`, os.Getpid()))
+	bar := time.Now().UTC().Add(-3 * time.Minute)
+	for _, folder := range []string{"BTC_USDT-USDT", "ETH_USDT-USDT"} { // where the runner writes them
+		dir := filepath.Join(statusDir, folder, "15", "inference")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		line := fmt.Sprintf(`{"event":"bar","asof_bar_ts":%q}`+"\n", bar.Format(time.RFC3339Nano))
+		if err := os.WriteFile(filepath.Join(dir, "inference_"+bar.Format("20060102")+".jsonl"), []byte(line), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var row *ipc.System
+	systems, _ := Reconcile(cfg)
+	for _, s := range systems {
+		if s.SystemID == acct+"/"+runner {
+			row = &s
+		}
+	}
+	if row == nil || row.State != ipc.StateRunning || len(row.Legs) != 2 {
+		t.Fatalf("crypto runner row = %+v", row)
+	}
+	if got := row.Symbols; len(got) != 2 || got[0] != "BTC/USDT-USDT" || got[1] != "ETH/USDT-USDT" {
+		t.Errorf("symbols = %v, want the logged symbols", got)
+	}
+	for _, leg := range row.Legs {
+		if leg.LastBarTS.IsZero() {
+			t.Errorf("leg %s found no bar under %s", leg.Symbol, leg.Inference)
+		}
+	}
+}
+
 // A running system is checked against its account folder: the account its status.json was written
 // under, and the terminal's login against the env file's LOGIN_ID.
 func TestReconcileFlagsAccountMismatch(t *testing.T) {

@@ -72,6 +72,23 @@ func TestScanSkipsDotDirs(t *testing.T) {
 	}
 }
 
+func TestScanAdaptsCryptoMultiSymbols(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "bybit.demo", "crypto_rsi_bybit-multi", "run.py"), "")
+	write(t, filepath.Join(root, "bybit.demo", "crypto_rsi_bybit-multi", "config.json"),
+		`{"name":"crypto_rsi_demo_bybit","venue":{"exchange_id":"bybit"},"strategies":[`+
+			`{"name":"crypto_rsi_bybit","market_symbol":"BTC/USDT:USDT","timeframe":"15m"},`+
+			`{"name":"crypto_rsi_bybit","market_symbol":"ETH/USDT:USDT","timeframe":"15m"}]}`)
+	cat, probs, err := Scan(root)
+	if err != nil || len(probs) != 0 || len(cat) != 1 {
+		t.Fatalf("scan = %+v, %+v, %v", cat, probs, err)
+	}
+	s := cat[0]
+	if !s.Multi || s.SystemID != "bybit.demo/crypto_rsi_bybit-multi" || len(s.Symbols) != 2 || s.Symbols[0] != "BTC/USDT-USDT" {
+		t.Fatalf("crypto multi = %+v, want bybit.demo/crypto_rsi_bybit-multi with logged symbols", s)
+	}
+}
+
 // TestScanReportsSystemsOutsideAccounts: the pre-account flat layout and unclassifiable paths become
 // problems, never systems, so the engine cannot start a runner that does not know its account.
 func TestScanReportsSystemsOutsideAccounts(t *testing.T) {

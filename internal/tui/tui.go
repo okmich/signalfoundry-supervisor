@@ -1030,6 +1030,11 @@ func (m model) importView() string {
 			"",
 			field("account", p.Account),
 			field("type", kind),
+		)
+		if p.Kind != "" { // a runner carries no MT5 / IB / crypto config
+			body = append(body, field("config", string(p.Kind)))
+		}
+		body = append(body,
 			field("system id", p.SystemID),
 			field("source", p.SourceDir),
 			field("target", p.TargetDir),

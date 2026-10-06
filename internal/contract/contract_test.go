@@ -81,3 +81,15 @@ func TestLastBarTSSkipsNonBarTail(t *testing.T) {
 		t.Errorf("LastBarTS = (%s, %v), want the last complete bar %s despite newer non-bar/partial lines", ts, ok, want)
 	}
 }
+
+func TestInferenceDirIsPathSafe(t *testing.T) {
+	got := InferenceDir("L", "bybit.demo", "crypto_rsi_bybit-multi", "BTC/USDT-USDT", "15")
+	want := filepath.Join("L", "bybit.demo", "crypto_rsi_bybit-multi", "BTC_USDT-USDT", "15", "inference")
+	if got != want {
+		t.Fatalf("InferenceDir = %q, want %q", got, want)
+	}
+	// Already-safe labels (MT5 / IB symbols, folder names) pass through, internal spaces kept.
+	if PathSafe(" Volatility 75 Index ") != "Volatility 75 Index" || PathSafe("EURUSD.r") != "EURUSD.r" {
+		t.Fatal("PathSafe must only replace separators and trim")
+	}
+}

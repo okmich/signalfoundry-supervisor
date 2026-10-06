@@ -926,6 +926,7 @@ func (m model) importView() string {
 			okStyle.Render("Validated — review, then install:"),
 			"",
 			field("type", kind),
+			field("config", string(p.Kind)),
 			field("system id", p.SystemID),
 			field("source", p.SourceDir),
 			field("target", p.TargetDir),

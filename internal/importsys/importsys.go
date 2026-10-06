@@ -1,14 +1,14 @@
 // Package importsys provisions a trading-system artefact directory into LIVE_BASE in the canonical,
 // discovery-compatible layout (FLEET_SUPERVISOR_SPEC §16, LOGGING_CONTRACT §7.1/§10). It validates
 // that the source conforms (run.py + config.json), classifies single vs multi from config.json
-// exactly as discovery does, refuses to overwrite a running system, archives any existing copy, and
+// exactly as discovery does (MT5, IB and crypto configs adapted by sysconfig to what each runner
+// logs), refuses to overwrite a running system, archives any existing copy, and
 // installs via a staged atomic rename so a crash never leaves a half-written artefact in the live
 // tree. It is the engine-independent core behind the TUI's import dialog: the engine consumes
 // LIVE_BASE read-only and re-discovers the new system on its next tick — no command is needed.
 package importsys
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -21,8 +21,10 @@ import (
 	"unicode"
 
 	"github.com/okmich/signalfoundry-supervisor/internal/config"
+	"github.com/okmich/signalfoundry-supervisor/internal/contract"
 	"github.com/okmich/signalfoundry-supervisor/internal/proc"
 	"github.com/okmich/signalfoundry-supervisor/internal/registry"
+	"github.com/okmich/signalfoundry-supervisor/internal/sysconfig"
 )
 
 // ArchiveDir / StagingDir are the importer-owned subtrees under LIVE_BASE. They hold copies of run.py
@@ -41,26 +43,15 @@ var reservedPathChars = regexp.MustCompile(`[<>:"|?*\x00-\x1f]`)
 // renders it for confirmation before anything is written.
 type Plan struct {
 	SourceDir   string
+	Kind        sysconfig.Kind // mt5 / ib / crypto, detected from config.json
 	Multi       bool
 	Strategy    string   // strategy code (the path label)
-	Symbol      string   // single-trader only
-	Symbols     []string // multi-trader only
-	Timeframe   int      // single-trader only
+	Symbol      string   // single-trader only: the symbol as the runner logs it
+	Symbols     []string // multi-trader only: the logged symbols
+	Timeframe   int      // single-trader only: minutes, as the runner logs it (the path label)
 	SystemID    string   // matches discovery's system_id exactly
 	TargetDir   string   // absolute destination under LIVE_BASE
 	WillArchive bool     // target already exists -> the current copy is archived first
-}
-
-type strategyEntry struct {
-	Name      string `json:"name"`
-	Symbol    string `json:"symbol"`
-	Timeframe int    `json:"timeframe"`
-}
-
-type sysConfig struct {
-	Name       string          `json:"name"`
-	Strategy   *strategyEntry  `json:"strategy"`
-	Strategies []strategyEntry `json:"strategies"`
 }
 
 // BuildPlan validates the source directory and resolves the canonical LIVE_BASE target. It returns a
@@ -102,47 +93,47 @@ func BuildPlan(cfg config.Config, sourceDir string) (Plan, error) {
 	if err != nil {
 		return Plan{}, fmt.Errorf("not a system folder: missing config.json in %s", src)
 	}
-	var sc sysConfig
-	if err := json.Unmarshal(raw, &sc); err != nil {
-		return Plan{}, fmt.Errorf("config.json is not valid JSON: %w", err)
+	// MT5, IB and crypto configs differ in how they write the symbol and the timeframe; sysconfig adapts each to
+	// what its runner logs (classification identical to discovery's), and refuses a timeframe the runner could
+	// not label.
+	sc, err := sysconfig.Parse(raw)
+	if err != nil {
+		return Plan{}, err
+	}
+	symbolField := "symbol"
+	if sc.Kind == sysconfig.KindCrypto {
+		symbolField = "market_symbol"
 	}
 
-	p := Plan{SourceDir: src}
-	switch {
-	case len(sc.Strategies) > 0: // multi-trader (mirrors discovery's classification)
-		first := sc.Strategies[0]
+	p := Plan{SourceDir: src, Kind: sc.Kind}
+	if sc.Multi {
+		first := sc.Sleeves[0]
 		if err := validateToken("strategy", first.Name); err != nil {
 			return Plan{}, err
 		}
-		for i, s := range sc.Strategies {
-			if err := validateToken(fmt.Sprintf("strategies[%d].symbol", i), s.Symbol); err != nil {
+		for i, s := range sc.Sleeves {
+			if err := validateToken(fmt.Sprintf("strategies[%d].%s", i, symbolField), s.Symbol); err != nil {
 				return Plan{}, err
-			}
-			if s.Timeframe <= 0 {
-				return Plan{}, fmt.Errorf("strategies[%d].timeframe must be a positive int, got %d", i, s.Timeframe)
 			}
 			p.Symbols = append(p.Symbols, s.Symbol)
 		}
 		root := runnerStrategyRoot(first.Name)
 		p.Multi, p.Strategy, p.SystemID = true, first.Name, root
 		p.TargetDir = filepath.Join(cfg.LiveBase, root)
-	case sc.Strategy != nil: // single-trader
-		s := sc.Strategy
+	} else {
+		s := sc.Sleeves[0]
 		if err := validateToken("strategy", s.Name); err != nil {
 			return Plan{}, err
 		}
-		if err := validateToken("symbol", s.Symbol); err != nil {
+		if err := validateToken(symbolField, s.Symbol); err != nil {
 			return Plan{}, err
 		}
-		if s.Timeframe <= 0 {
-			return Plan{}, fmt.Errorf("strategy.timeframe must be a positive int, got %d", s.Timeframe)
-		}
-		strat, sym, tf := pathSafe(s.Name), pathSafe(s.Symbol), strconv.Itoa(s.Timeframe)
-		p.Strategy, p.Symbol, p.Timeframe = s.Name, s.Symbol, s.Timeframe
+		// The <timeframe> label is MINUTES, as the runner's log folder: an MT5 H1 config (constant 16385) lands
+		// in .../60, beside its logs, so the Supervisor finds its bars.
+		strat, sym, tf := contract.PathSafe(s.Name), contract.PathSafe(s.Symbol), strconv.Itoa(s.TimeframeMinutes)
+		p.Strategy, p.Symbol, p.Timeframe = s.Name, s.Symbol, s.TimeframeMinutes
 		p.SystemID = strat + "/" + sym + "/" + tf
 		p.TargetDir = filepath.Join(cfg.LiveBase, strat, sym, tf)
-	default:
-		return Plan{}, fmt.Errorf("config.json classifies as neither single (a `strategy` object) nor multi (a non-empty `strategies[]`)")
 	}
 
 	if _, err := os.Stat(p.TargetDir); err == nil {
@@ -258,12 +249,6 @@ func validateToken(kind, value string) error {
 		return fmt.Errorf("%s %q contains a reserved filesystem character", kind, value)
 	}
 	return nil
-}
-
-// pathSafe mirrors identity._path_safe: replace path separators only and trim — internal spaces are
-// intentionally preserved so the live folder label matches the framework's log folder byte-for-byte.
-func pathSafe(s string) string {
-	return strings.TrimSpace(strings.NewReplacer("/", "_", "\\", "_").Replace(s))
 }
 
 // runnerStrategyRoot mirrors discovery.runnerStrategyRoot / identity.runner_strategy_root: append the

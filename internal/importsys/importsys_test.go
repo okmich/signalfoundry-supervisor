@@ -273,3 +273,72 @@ func TestBuildPlanRefusesRunning(t *testing.T) {
 		t.Fatalf("want running refusal, got %v", err)
 	}
 }
+
+func TestBuildPlanAdaptsEachConfigKind(t *testing.T) {
+	cfg := testCfg(t)
+	cases := []struct {
+		name, config, systemID string
+		target                 []string
+		kind                   string
+		symbols                []string
+	}{
+		{"crypto multi (crypto_rsi_demo)",
+			`{"name":"crypto_rsi_demo_bybit","venue":{"exchange_id":"bybit","environment":"demo"},"strategies":[` +
+				`{"name":"crypto_rsi_bybit","market_symbol":"BTC/USDT:USDT","timeframe":"15m"},` +
+				`{"name":"crypto_rsi_bybit","market_symbol":"ETH/USDT:USDT","timeframe":"15m"}]}`,
+			"crypto_rsi_bybit-multi", []string{"crypto_rsi_bybit-multi"}, "crypto",
+			[]string{"BTC/USDT-USDT", "ETH/USDT-USDT"}},
+		{"crypto single: logged symbol made path-safe, CCXT timeframe in minutes",
+			`{"name":"x","venue":{"exchange_id":"binance"},"strategy":{"name":"s","market_symbol":"BTC/USDT:USDT","timeframe":"1h"}}`,
+			"s/BTC_USDT-USDT/60", []string{"s", "BTC_USDT-USDT", "60"}, "crypto", nil},
+		{"IB single: bar size in minutes",
+			`{"name":"r","strategy":{"name":"rsi2_mean_reversion","symbol":"SPY","timeframe":"5 mins"},"strategies":[],` +
+				`"ib_contracts":{"rsi2_mean_reversion":{"sec_type":"STK"}}}`,
+			"rsi2_mean_reversion/SPY/5", []string{"rsi2_mean_reversion", "SPY", "5"}, "ib", nil},
+		{"MT5 single H1: constant 16385 lands in the minutes folder its logs use",
+			`{"name":"i","runloop":{},"strategy":{"name":"idxmon","symbol":"US500.r","timeframe":16385},"strategies":[]}`,
+			"idxmon/US500.r/60", []string{"idxmon", "US500.r", "60"}, "mt5", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := BuildPlan(cfg, srcWith(t, tc.config))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.SystemID != tc.systemID || string(p.Kind) != tc.kind {
+				t.Fatalf("plan = %+v, want %s (%s)", p, tc.systemID, tc.kind)
+			}
+			if want := filepath.Join(append([]string{cfg.LiveBase}, tc.target...)...); p.TargetDir != want {
+				t.Fatalf("target = %q, want %q", p.TargetDir, want)
+			}
+			for i, s := range tc.symbols {
+				if p.Symbols[i] != s {
+					t.Errorf("symbols = %v, want %v", p.Symbols, tc.symbols)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildPlanRejectsUnrunnableConfigs(t *testing.T) {
+	cfg := testCfg(t)
+	cases := map[string]struct{ config, msg string }{
+		"old-format IB int timeframe": {
+			`{"strategy":{"name":"s","symbol":"SPY","timeframe":5},"strategies":[],"ib_contracts":{"s":{}}}`, "bar size"},
+		"crypto timeframe above 1d": {
+			`{"venue":{"exchange_id":"bybit"},"strategy":{"name":"s","market_symbol":"BTC/USDT:USDT","timeframe":"1w"}}`,
+			"outside 1m..1d"},
+		"crypto sleeve without market_symbol": {
+			`{"venue":{"exchange_id":"bybit"},"strategies":[{"name":"s","market_symbol":"BTC/USDT:USDT","timeframe":"5m"},` +
+				`{"name":"s","timeframe":"5m"}]}`, "strategies[1].market_symbol"},
+		"crypto and IB markers together": {
+			`{"venue":{},"ib_contracts":{},"strategy":{"name":"s","symbol":"SPY","timeframe":"5 mins"}}`, "both crypto"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := BuildPlan(cfg, srcWith(t, tc.config)); err == nil || !strings.Contains(err.Error(), tc.msg) {
+				t.Fatalf("err = %v, want it to mention %q", err, tc.msg)
+			}
+		})
+	}
+}

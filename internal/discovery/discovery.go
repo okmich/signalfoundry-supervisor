@@ -3,11 +3,12 @@
 package discovery
 
 import (
-	"encoding/json"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/okmich/signalfoundry-supervisor/internal/sysconfig"
 )
 
 // System is a configured system found on disk (its artefact dir holds run.py + config.json). A
@@ -68,26 +69,23 @@ func Scan(liveBase string) ([]System, error) {
 }
 
 // readMultiConfig reports a multi-trader iff dir/config.json has a non-empty strategies[]; it returns
-// the strategy code and the per-symbol list. A missing/unreadable config or an empty strategies[]
-// (a single-trader's config carries a singular `strategy` and an empty `strategies`) yields ok=false.
+// the strategy code and the per-symbol list as the runner logs it (MT5 / IB / crypto adapted by sysconfig,
+// e.g. crypto's market_symbol "BTC/USDT:USDT" -> "BTC/USDT-USDT"). Timeframes are not interpreted here, so a
+// system is never dropped from its runner root over one. A missing/unreadable config or an empty
+// strategies[] (a single-trader's config carries a singular `strategy`) yields ok=false.
 func readMultiConfig(dir string) (code string, symbols []string, ok bool) {
 	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err != nil {
 		return "", nil, false
 	}
-	var c struct {
-		Strategies []struct {
-			Name   string `json:"name"`
-			Symbol string `json:"symbol"`
-		} `json:"strategies"`
-	}
-	if json.Unmarshal(b, &c) != nil || len(c.Strategies) == 0 {
+	c, err := sysconfig.Classify(b)
+	if err != nil || !c.Multi {
 		return "", nil, false
 	}
-	for _, s := range c.Strategies {
+	for _, s := range c.Sleeves {
 		symbols = append(symbols, s.Symbol)
 	}
-	return c.Strategies[0].Name, symbols, true
+	return c.Sleeves[0].Name, symbols, true
 }
 
 // runnerStrategyRoot appends the statutory -multi suffix (idempotently), mirroring the framework's
